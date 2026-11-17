@@ -1,0 +1,217 @@
+# Wukong .gitignore
+# This is a PUBLIC repository. The first half of this file keeps private
+# information out; the second half is ordinary build and editor clutter.
+# When in doubt, put a file under private/ and it will never be committed.
+
+# ============================================================
+# 1. Secrets and credentials
+# ============================================================
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+*.jks
+id_rsa*
+id_ed25519*
+*.gpg
+secrets/
+credentials/
+**/credentials*.json
+**/service-account*.json
+**/*secret*.json
+**/*secret*.yaml
+**/*secret*.yml
+**/token.json
+**/*_token.json
+**/*-token.json
+.netrc
+.npmrc
+.pypirc
+
+# ============================================================
+# 2. Private and machine-specific files
+# ============================================================
+# Catch-all folders for anything that must stay local
+private/
+local/
+scratch/
+notes-private/
+
+# Any file marked as local, e.g. home_location.local.yaml
+*.local
+*.local.*
+!*.local.example
+!*.local.example.*
+config/local/
+
+# ============================================================
+# 3. Flight data (contains GPS position of home and flight paths)
+# ============================================================
+*.ulg
+*.ulog
+*.tlog
+*.rlog
+flight_logs/
+logs/
+# Mission and geofence files with real coordinates
+*.plan
+*.mission
+*.waypoints
+*.kml
+*.kmz
+*.gpx
+# Parameter dumps can include serial numbers and calibration of real hardware
+*.params
+!**/sim/**/*.params
+
+# ============================================================
+# 4. Recorded sensor data and imagery (may show homes and people)
+# ============================================================
+*.bag
+*.db3
+*.mcap
+rosbag2_*/
+bags/
+recordings/
+captures/
+photos/
+videos/
+data/*
+!data/README.md
+datasets/*
+!datasets/README.md
+# Maps and reconstructions of real places
+maps/
+*.pcd
+*.ply
+*.las
+*.laz
+*.pgm
+
+# ============================================================
+# 5. Model weights and other large binaries
+# ============================================================
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.engine
+*.trt
+*.tflite
+*.safetensors
+*.gguf
+*.h5
+*.weights
+models/weights/
+checkpoints/
+
+# ============================================================
+# 6. AI assistant local state
+# ============================================================
+.claude/settings.local.json
+.claude/*.local.*
+CLAUDE.local.md
+.aider*
+.cursor/
+
+# ============================================================
+# 7. ROS 2 / colcon
+# ============================================================
+build/
+install/
+log/
+.colcon/
+.ros/
+
+# ============================================================
+# 8. PX4, Gazebo and embedded builds
+# ============================================================
+PX4-Autopilot/build/
+*.px4
+*.elf
+*.hex
+*.map
+.gz/
+.gazebo/
+.ignition/
+
+# ============================================================
+# 9. C / C++ / CMake
+# ============================================================
+*.o
+*.a
+*.so
+*.dylib
+*.out
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+Testing/
+cmake-build-*/
+
+# ============================================================
+# 10. Python
+# ============================================================
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+.venv/
+venv/
+env/
+.pixi/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+.coverage
+htmlcov/
+
+# ============================================================
+# 11. Node (tools, dashboards)
+# ============================================================
+node_modules/
+npm-debug.log*
+yarn-error.log*
+
+# ============================================================
+# 12. Docker and virtual machines
+# ============================================================
+docker-compose.override.yml
+*.qcow2
+*.utm/
+*.vdi
+*.vmdk
+
+# ============================================================
+# 13. Editors and operating systems
+# ============================================================
+.DS_Store
+._*
+.AppleDouble
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+*~
+.idea/
+*.iml
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.example.json
+*.code-workspace
+
+# ============================================================
+# 14. Temporary files
+# ============================================================
+tmp/
+temp/
+*.tmp
+*.bak
+*.orig
