@@ -62,7 +62,9 @@ Design principles:
 
 ### Status
 
-Early planning. See [docs/PLAN.md](docs/PLAN.md) for the roadmap (in Chinese).
+M0 (development environment) is done: a ROS 2 node flies the simulated drone
+through takeoff, waypoints and landing. See [docs/PLAN.md](docs/PLAN.md) for the
+roadmap and [docs/DEV_SETUP.md](docs/DEV_SETUP.md) to try it (both in Chinese).
 
 ### Safety and regulations
 
@@ -127,7 +129,8 @@ Wukong 是一个开源项目，探索无人机如何听懂一句日常语言的�
 
 ### 当前状态
 
-处于早期规划阶段。路线图见 [docs/PLAN.md](docs/PLAN.md)。
+M0（开发环境）已完成：ROS 2 节点可以在仿真中控制无人机起飞、按航点飞行并降落。
+路线图见 [docs/PLAN.md](docs/PLAN.md)，上手步骤见 [docs/DEV_SETUP.md](docs/DEV_SETUP.md)。
 
 ### 安全与法规
 

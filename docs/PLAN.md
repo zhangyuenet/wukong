@@ -88,10 +88,11 @@
 
 ### M0 开发环境
 
-- 搭好 Ubuntu 开发环境（步骤见 [DEV_SETUP.md](DEV_SETUP.md)）
-- PX4 仿真、Gazebo、ROS 2 三者连通
-- 用 ROS 2 节点让仿真无人机起飞、飞到指定点、降落
-- 确定仓库的目录结构和代码规范
+- [x] 搭好 Ubuntu 开发环境（步骤见 [DEV_SETUP.md](DEV_SETUP.md)）
+- [x] PX4 仿真、Gazebo、ROS 2 三者连通
+- [x] 用 ROS 2 节点让仿真无人机起飞、飞到指定点、降落（`wukong_flight` 包的
+  `fly_mission` 节点）
+- [x] 确定仓库的目录结构和代码规范（见 [CONVENTIONS.md](CONVENTIONS.md)）
 
 **完成标准**：一条命令启动仿真，一个 ROS 2 节点能控制无人机完成起降。
 
@@ -156,7 +157,7 @@
 - [x] 开发环境：MacBook Air M2 上的 VMware Fusion 虚拟机
 - [x] Ubuntu 版本：24.04 LTS（ARM64）
 - [x] ROS 2 版本：Jazzy，配合 Gazebo Harmonic 和 PX4 v1.17，见 [DEV_SETUP.md](DEV_SETUP.md)
-- [ ] 主要开发语言的分工（Python 与 C++）
+- [x] 主要开发语言的分工：先用 Python，C++ 留给性能敏感的感知环节，见 [CONVENTIONS.md](CONVENTIONS.md)
 - [ ] 云端大模型的选型
 - [x] 开源许可证：Apache-2.0
 - [ ] 机载电脑和相机的型号（M4 前确定）

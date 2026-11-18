@@ -100,6 +100,29 @@ ros2 run px4_ros_com offboard_control               # 解锁，起飞到 5 米�
 NED 坐标系中负值表示向上），就说明 PX4、Gazebo、ROS 2 三者已经连通。之后可以
 在 `pxh>` 中输入 `commander land` 让它降落。
 
+## 6. 用 Wukong 自己的节点飞一次
+
+`wukong_flight` 功能包的 `fly_mission` 节点完成起飞、按航点飞行、降落，结束后
+自动退出。仿真启动后，在终端 2 中：
+
+```bash
+colcon build --symlink-install --packages-select wukong_flight   # 第一次或改动 setup.py 后
+
+ros2 run wukong_flight fly_mission                    # 起飞到 5 米，向北飞 5 米，降落
+ros2 run wukong_flight fly_mission --ros-args \
+    --params-file install/wukong_flight/share/wukong_flight/config/square.yaml   # 飞一个 10 米正方形
+ros2 run wukong_flight fly_mission --ros-args -p waypoints:="[20.0, 0.0, 8.0]"   # 自定义航点
+```
+
+航点是“北、东、高度”三个数一组，单位米，相对起飞点。正常结束时退出码为 0。
+
+- 飞行中按 **Ctrl+C**：先刹车悬停，再自动降落，落地后退出。再按一次立即退出，
+  由 PX4 的失效保护接管。
+- 飞行中在 `pxh>` 里切换模式（例如 `commander mode auto:loiter`），节点会认为有人接管，
+  立即停止发指令并退出。
+
+可以连续运行多次，不需要重启仿真。每次都以当前所在位置为起飞点。
+
 > **关于 `NAV_DLL_ACT`**：PX4 v1.17 的 `gz_x500` 机型把 `NAV_DLL_ACT`（数据链
 > 丢失时的动作）设为 2（返航）。这样一来，没有 MAVLink 地面站（如 QGroundControl）
 > 时，PX4 会报 `Preflight Fail: No connection to the GCS` 并拒绝解锁。仿真中
@@ -107,7 +130,7 @@ NED 坐标系中负值表示向上），就说明 PX4、Gazebo、ROS 2 三者已
 > 启动后设置：用 `PX4_PARAM_NAV_DLL_ACT=0` 环境变量在启动时设置不会生效。
 > **这一设置只用于仿真，真机必须保留数据链丢失保护。**
 
-## 6. 常见问题
+## 7. 常见问题
 
 **Gazebo 三维视图一片灰色，看不到地面和无人机**
 

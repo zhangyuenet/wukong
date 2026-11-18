@@ -1,0 +1,14 @@
+# Fly a 10 m square at 5 m altitude, then land at the takeoff point.
+# 在 5 米高度飞一个 10 米见方的正方形，然后在起飞点降落。
+#   ros2 run wukong_flight fly_mission --ros-args --params-file <this file>
+fly_mission:
+  ros__parameters:
+    takeoff_altitude: 5.0
+    # north, east, altitude (m), relative to the takeoff point
+    # 北、东、高度（米），相对起飞点
+    waypoints: [10.0, 0.0, 5.0,
+                10.0, 10.0, 5.0,
+                0.0, 10.0, 5.0,
+                0.0, 0.0, 5.0]
+    hold_time: 2.0
+    tolerance: 0.5
