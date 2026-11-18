@@ -126,6 +126,8 @@ install/
 log/
 .colcon/
 .ros/
+# Third-party packages imported from wukong.repos
+src/third_party/
 
 # ============================================================
 # 8. PX4, Gazebo and embedded builds

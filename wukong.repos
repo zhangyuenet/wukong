@@ -1,0 +1,13 @@
+# Third-party ROS 2 packages, imported into src/third_party/ (not committed).
+# 第三方 ROS 2 功能包，导入到 src/third_party/（不提交）。
+#   vcs import --input wukong.repos src/third_party
+# px4_msgs branch must match PX4_VERSION in scripts/versions.env.
+repositories:
+  px4_msgs:
+    type: git
+    url: https://github.com/PX4/px4_msgs.git
+    version: release/1.17
+  px4_ros_com:
+    type: git
+    url: https://github.com/PX4/px4_ros_com.git
+    version: main

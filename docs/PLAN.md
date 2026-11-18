@@ -88,7 +88,7 @@
 
 ### M0 开发环境
 
-- 搭好 Ubuntu 开发环境
+- 搭好 Ubuntu 开发环境（步骤见 [DEV_SETUP.md](DEV_SETUP.md)）
 - PX4 仿真、Gazebo、ROS 2 三者连通
 - 用 ROS 2 节点让仿真无人机起飞、飞到指定点、降落
 - 确定仓库的目录结构和代码规范
@@ -154,8 +154,8 @@
 ## 8. 待定事项
 
 - [x] 开发环境：MacBook Air M2 上的 VMware Fusion 虚拟机
-- [ ] Ubuntu 版本（倾向 24.04 LTS，它是 PX4 当前的 CI 和发布目标）
-- [ ] ROS 2 版本（倾向 Jazzy，与 Ubuntu 24.04 配套）
+- [x] Ubuntu 版本：24.04 LTS（ARM64）
+- [x] ROS 2 版本：Jazzy，配合 Gazebo Harmonic 和 PX4 v1.17，见 [DEV_SETUP.md](DEV_SETUP.md)
 - [ ] 主要开发语言的分工（Python 与 C++）
 - [ ] 云端大模型的选型
 - [x] 开源许可证：Apache-2.0
