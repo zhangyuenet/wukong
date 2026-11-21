@@ -1,0 +1,206 @@
+# Copyright 2026 Yue Zhang
+# SPDX-License-Identifier: Apache-2.0
+"""
+The skill library and the pre-flight check of a plan.
+
+A plan is a list of skills. Whoever writes it (a person, a config file or a
+large model), it must pass check_plan() before the vehicle arms. The check is
+pure geometry: limits on altitude and distance, and no-fly boxes around known
+obstacles. It never trusts the author.
+技能库和飞行前的计划检查。无论计划是谁写的（人、配置文件或大模型），解锁前都必须
+通过 check_plan()。检查只依赖几何：高度、距离限制和已知障碍物周围的禁飞区。
+
+North and east are in metres, either relative to the takeoff point (the
+default) or in PX4's local frame (origin where PX4 started, used with a map).
+Altitude is always metres above the takeoff point, up positive.
+北、东（米）可以相对起飞点（默认），也可以用 PX4 本地坐标系（配合地图使用）。
+高度始终是相对起飞点的米数，向上为正。
+"""
+
+from dataclasses import dataclass, field
+import math
+from typing import List, Optional, Sequence, Tuple, Union
+
+
+@dataclass(frozen=True)
+class Takeoff:
+    """Climb straight up above the takeoff point. Must be the first skill."""
+
+    altitude: float
+
+
+@dataclass(frozen=True)
+class GoTo:
+    """Fly in a straight line to a point; optionally turn to face another point."""
+
+    north: float
+    east: float
+    altitude: float
+    # Face this (north, east) point on arrival, e.g. the part of a house to
+    # photograph. None keeps the current heading. 到达后朝向该点，None 保持航向。
+    look_at: Optional[Tuple[float, float]] = None
+
+
+@dataclass(frozen=True)
+class Hover:
+    """Hold position for a number of seconds."""
+
+    seconds: float
+
+
+@dataclass(frozen=True)
+class TakePhoto:
+    """Settle, then take one photo with the forward camera."""
+
+    label: str
+
+
+@dataclass(frozen=True)
+class ReturnHome:
+    """Fly back above the takeoff point at the current altitude, then land."""
+
+
+@dataclass(frozen=True)
+class Land:
+    """Land where the vehicle is."""
+
+
+Skill = Union[Takeoff, GoTo, Hover, TakePhoto, ReturnHome, Land]
+TERMINAL = (ReturnHome, Land)
+
+
+@dataclass(frozen=True)
+class Box:
+    """An axis-aligned no-fly box: north/east extents and a top height, from the ground up."""
+
+    north_min: float
+    north_max: float
+    east_min: float
+    east_max: float
+    top: float
+    name: str = ''
+
+    def inflated(self, margin: float) -> 'Box':
+        return Box(self.north_min - margin, self.north_max + margin,
+                   self.east_min - margin, self.east_max + margin,
+                   self.top + margin, self.name)
+
+    def contains(self, north: float, east: float, altitude: float) -> bool:
+        return (self.north_min <= north <= self.north_max
+                and self.east_min <= east <= self.east_max
+                and altitude <= self.top)
+
+
+@dataclass(frozen=True)
+class Limits:
+    min_altitude: float = 1.5        # m, lowest allowed except while landing
+    max_altitude: float = 20.0       # m
+    max_distance: float = 50.0       # m, horizontal, from the takeoff point
+    max_hover: float = 60.0          # s, per Hover skill
+    max_skills: int = 40
+    no_fly: Tuple[Box, ...] = ()
+    margin: float = 2.0              # m, kept from every no-fly box
+    sample_step: float = 0.25        # m, resolution of the path check
+
+
+@dataclass
+class PlanCheck:
+    errors: List[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return not self.errors
+
+
+def _segment_hits(a, b, box: Box, step: float) -> bool:
+    """Whether the straight segment a -> b, each (north, east, alt), enters box."""
+    n = max(1, int(math.ceil(math.dist(a, b) / step)))
+    return any(box.contains(*(a[k] + (b[k] - a[k]) * i / n for k in range(3)))
+               for i in range(n + 1))
+
+
+def check_plan(plan: Sequence[Skill], limits: Limits = Limits(),
+               start: Tuple[float, float] = (0.0, 0.0)) -> PlanCheck:
+    """
+    Check a plan before flight. An empty error list means it may fly.
+
+    start is the takeoff point in the plan's frame: (0, 0) when the plan is
+    relative to the takeoff point. max_distance is measured from start.
+    start 是起飞点在计划坐标系中的位置。
+    """
+    result = PlanCheck()
+    err = result.errors.append
+    if not plan:
+        err('plan is empty')
+        return result
+    if len(plan) > limits.max_skills:
+        err(f'plan has {len(plan)} skills, the limit is {limits.max_skills}')
+    if not isinstance(plan[0], Takeoff):
+        err('the first skill must be takeoff')
+    if not isinstance(plan[-1], TERMINAL):
+        err('the last skill must be land or return_home')
+    boxes = [b.inflated(limits.margin) for b in limits.no_fly]
+
+    home = (float(start[0]), float(start[1]))
+    pos = (home[0], home[1], 0.0)  # north, east, altitude
+    for i, skill in enumerate(plan, 1):
+        where = f'skill {i} ({type(skill).__name__})'
+        if isinstance(skill, Takeoff) and i > 1:
+            err(f'{where}: takeoff is only allowed as the first skill')
+        if isinstance(skill, TERMINAL) and i < len(plan):
+            err(f'{where}: nothing may follow land or return_home')
+
+        if isinstance(skill, Takeoff):
+            nxt = (home[0], home[1], skill.altitude)
+        elif isinstance(skill, GoTo):
+            nxt = (skill.north, skill.east, skill.altitude)
+            if skill.look_at is not None and len(skill.look_at) != 2:
+                err(f'{where}: look_at must be (north, east)')
+        elif isinstance(skill, ReturnHome):
+            nxt = (home[0], home[1], pos[2])
+        else:
+            nxt = pos
+            if isinstance(skill, Hover) and not 0 <= skill.seconds <= limits.max_hover:
+                err(f'{where}: hover {skill.seconds} s is outside 0..{limits.max_hover} s')
+            if isinstance(skill, TakePhoto) and not skill.label.strip():
+                err(f'{where}: photo label is empty')
+
+        if nxt != pos:
+            if not limits.min_altitude <= nxt[2] <= limits.max_altitude:
+                err(f'{where}: altitude {nxt[2]:.1f} m is outside '
+                    f'{limits.min_altitude}..{limits.max_altitude} m')
+            away = math.hypot(nxt[0] - home[0], nxt[1] - home[1])
+            if away > limits.max_distance:
+                err(f'{where}: {away:.1f} m from home, the limit is {limits.max_distance} m')
+            for box in boxes:
+                if _segment_hits(pos, nxt, box, limits.sample_step):
+                    err(f'{where}: path from {_fmt(pos)} to {_fmt(nxt)} comes within '
+                        f'{limits.margin} m of no-fly box {box.name or "?"}')
+        pos = nxt
+    # The final descent (land or return_home) goes straight down.
+    for box in boxes:
+        if _segment_hits(pos, (pos[0], pos[1], 0.0), box, limits.sample_step):
+            err(f'landing at {_fmt(pos)} descends into no-fly box {box.name or "?"}')
+    return result
+
+
+def _fmt(p) -> str:
+    return f'(N {p[0]:.1f}, E {p[1]:.1f}, alt {p[2]:.1f})'
+
+
+def describe(skill: Skill) -> str:
+    """One line, for logs and for showing a plan to a person."""
+    if isinstance(skill, Takeoff):
+        return f'takeoff to {skill.altitude:.1f} m'
+    if isinstance(skill, GoTo):
+        s = f'go to N {skill.north:.1f} E {skill.east:.1f} alt {skill.altitude:.1f}'
+        if skill.look_at is not None:
+            s += f', facing N {skill.look_at[0]:.1f} E {skill.look_at[1]:.1f}'
+        return s
+    if isinstance(skill, Hover):
+        return f'hover {skill.seconds:.0f} s'
+    if isinstance(skill, TakePhoto):
+        return f'take photo "{skill.label}"'
+    if isinstance(skill, ReturnHome):
+        return 'return home and land'
+    return 'land'

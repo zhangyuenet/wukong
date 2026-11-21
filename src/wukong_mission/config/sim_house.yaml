@@ -1,0 +1,41 @@
+# Known map of the simulated house world (sim/worlds/wukong_house.sdf).
+# M1 uses a known map; M2 replaces it with perception.
+# 仿真房屋世界的已知地图。M1 使用已知地图，M2 改为视觉识别。
+#
+# Frame: PX4 local frame, origin where PX4 started (the spawn point in
+# simulation). north/east in metres. Heights in metres above the ground.
+# Real sites go in config/local/ at the repo root, never committed.
+# 真实地点的地图放在仓库根目录的 config/local/，不提交。
+
+name: simulated house
+houses:
+  - name: house
+    # Footprint centre and size. The roof overhangs the walls by 0.5 m.
+    center: [15.0, 0.0]          # north, east
+    depth_north_south: 8.0
+    width_east_west: 10.0
+    roof_overhang: 0.5
+    eave_height: 2.7
+    ridge_height: 5.3
+    ridge_direction: east-west
+    gutters:
+      - name: south gutter
+        # end points, (north, east); runs along the south eave
+        from: [10.45, -5.3]
+        to: [10.45, 5.3]
+        height: 2.65
+      - name: north gutter
+        from: [19.55, -5.3]
+        to: [19.55, 5.3]
+        height: 2.65
+
+limits:
+  min_altitude: 1.5
+  max_altitude: 15.0
+  max_distance: 40.0     # from the takeoff point
+  margin: 2.0            # kept from every house, on top of its overhang
+
+camera:
+  # PX4 x500_mono_cam: fixed, facing forward, level.
+  horizontal_fov_deg: 100
+  vertical_fov_deg: 83

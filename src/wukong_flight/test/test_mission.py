@@ -3,22 +3,25 @@
 """Unit tests for the mission state machine, using a crude simulated vehicle."""
 
 from dataclasses import replace
+import math
 
 import pytest
 
-from wukong_flight.mission import (Command, Mission, MissionConfig, Phase,
-                                   VehicleState, waypoints_from_flat)
+from wukong_flight.mission import (Command, Mission, MissionConfig, Phase, PlanRejected,
+                                   VehicleState, waypoint_plan, waypoints_from_flat)
+from wukong_flight.skills import GoTo, Hover, Land, ReturnHome, Takeoff, TakePhoto
 
 DT = 0.05
 
 
 class FakeVehicle:
-    """Just enough PX4 behaviour: arm/offboard on command, jump towards setpoints."""
+    """Just enough PX4 behaviour: arm/offboard on command, chase setpoints at 20 m/s."""
 
     def __init__(self) -> None:
         self.s = VehicleState(t=0.0, connected=True, position_valid=True,
                               preflight_ok=True, heading=0.3)
         self.commands = []
+        self.setpoints = []
         self.offboard_allowed = True
 
     def apply(self, out) -> None:
@@ -33,13 +36,15 @@ class FakeVehicle:
                 s = replace(s, armed=False)
             elif c == Command.LAND:
                 s = replace(s, offboard=False, landing=True)
+        if out.setpoint is not None:
+            self.setpoints.append(out.setpoint)
         if out.setpoint is not None and s.offboard and s.armed:
-            # move 1 m per tick towards the setpoint
             sp = out.setpoint
-            d = ((sp.x - s.x) ** 2 + (sp.y - s.y) ** 2 + (sp.z - s.z) ** 2) ** 0.5
+            d = math.dist((s.x, s.y, s.z), (sp.x, sp.y, sp.z))
             k = min(1.0, 1.0 / d) if d > 0 else 0.0
             s = replace(s, x=s.x + k * (sp.x - s.x), y=s.y + k * (sp.y - s.y),
-                        z=s.z + k * (sp.z - s.z), landed=False, speed=k * d / DT)
+                        z=s.z + k * (sp.z - s.z), heading=sp.yaw, landed=False,
+                        speed=k * d / DT)
         else:
             s = replace(s, speed=0.0)
         if s.landing:
@@ -49,49 +54,74 @@ class FakeVehicle:
         self.s = replace(s, t=s.t + DT)
 
 
-def run(mission, vehicle, max_ticks=5000, on_tick=None):
+def run(mission, vehicle, max_ticks=20000, on_tick=None, on_photo=None):
     phases = [mission.phase]
     for i in range(max_ticks):
         if on_tick:
             on_tick(i, mission, vehicle)
         out = mission.step(vehicle.s)
-        if not phases or phases[-1] != mission.phase:
+        if phases[-1] != mission.phase:
             phases.append(mission.phase)
+        if out.photo is not None and on_photo is not None:
+            on_photo(out.photo, mission, vehicle)
         vehicle.apply(out)
         if mission.finished:
             break
     return phases
 
 
+def square():
+    return waypoint_plan(5, ((10, 0, 5), (10, 10, 8)), 0.5)
+
+
 def test_full_mission():
-    m = Mission(MissionConfig(takeoff_altitude=5, waypoints=((10, 0, 5), (10, 10, 8)),
-                              hold_time=0.5))
+    m = Mission(square())
     v = FakeVehicle()
     phases = run(m, v)
     assert m.phase == Phase.DONE and m.failure is None
-    assert phases == [Phase.WAIT_READY, Phase.PRESTREAM, Phase.ARMING, Phase.TAKEOFF,
-                      Phase.GOTO, Phase.HOLD, Phase.GOTO, Phase.HOLD, Phase.LAND, Phase.DONE]
+    assert phases == [Phase.WAIT_READY, Phase.PRESTREAM, Phase.ARMING, Phase.RUNNING,
+                      Phase.LAND, Phase.DONE]
     assert Command.LAND in v.commands
+    assert m.index == len(m.plan) - 1
+
+
+def test_bad_plan_is_rejected_before_anything_flies():
+    with pytest.raises(PlanRejected) as e:
+        Mission([GoTo(1, 1, 5), Land()])
+    assert 'first skill must be takeoff' in str(e.value)
 
 
 def test_targets_are_relative_to_home_and_keep_heading():
-    m = Mission(MissionConfig(waypoints=((3, 4, 6),)))
+    m = Mission([Takeoff(5), GoTo(3, 4, 6), Land()])
     v = FakeVehicle()
     v.s = replace(v.s, x=100.0, y=-50.0, z=-0.2)
-    seen = []
-
-    def watch(i, mission, vehicle):
-        if mission.phase == Phase.GOTO:
-            seen.append(mission.target())
-    run(m, v, on_tick=watch)
-    sp = seen[0]
+    run(m, v)
+    assert m.phase == Phase.DONE
+    sp = v.setpoints[-1]                       # the last setpoint: at the waypoint
     assert (sp.x, sp.y) == pytest.approx((103.0, -46.0))
-    assert sp.z == pytest.approx(-6.2)     # 6 m above home, NED z is down
-    assert sp.yaw == pytest.approx(0.3)
+    assert sp.z == pytest.approx(-6.2)          # 6 m above home, NED z is down
+    assert sp.yaw == pytest.approx(0.3)         # no look_at: heading unchanged
+
+
+def test_look_at_turns_towards_the_target():
+    # From (0, 0) look at a point due east: yaw = +90 deg in NED.
+    m = Mission([Takeoff(5), GoTo(0, 0, 5, look_at=(0, 10)), Land()])
+    v = FakeVehicle()
+    run(m, v)
+    assert v.setpoints[-1].yaw == pytest.approx(math.pi / 2)
+
+
+def test_setpoint_moves_at_max_speed():
+    m = Mission([Takeoff(5), GoTo(30, 0, 5), Land()], MissionConfig(max_speed=2.0))
+    v = FakeVehicle()
+    run(m, v)
+    steps = [math.dist((a.x, a.y, a.z), (b.x, b.y, b.z))
+             for a, b in zip(v.setpoints, v.setpoints[1:])]
+    assert max(steps) <= 2.0 * DT + 1e-9
 
 
 def test_streams_setpoints_before_requesting_offboard():
-    m = Mission(MissionConfig())
+    m = Mission(square())
     v = FakeVehicle()
     outs = []
     for _ in range(100):
@@ -104,8 +134,45 @@ def test_streams_setpoints_before_requesting_offboard():
     assert len(streamed) * DT >= 1.0 - 1e-9
 
 
+def test_photo_waits_for_settle_and_continues_after_capture():
+    m = Mission([Takeoff(5), GoTo(5, 0, 5, look_at=(15, 0)), TakePhoto('south gutter'),
+                 ReturnHome()])
+    v = FakeVehicle()
+    taken = []
+
+    def shoot(label, mission, vehicle):
+        taken.append((label, vehicle.s.speed))
+        mission.photo_done(True)
+    run(m, v, on_photo=shoot)
+    assert m.phase == Phase.DONE
+    assert m.photos == [('south gutter', True)]
+    assert taken[0][1] < 0.3                      # vehicle was still
+
+
+def test_photo_timeout_does_not_stop_the_mission():
+    m = Mission([Takeoff(5), TakePhoto('nothing answers'), Land()],
+                MissionConfig(photo_timeout=0.5))
+    run(m, FakeVehicle())                         # nobody calls photo_done
+    assert m.phase == Phase.DONE
+    assert m.photos == [('nothing answers', False)]
+
+
+def test_return_home_flies_back_then_lands():
+    m = Mission([Takeoff(5), GoTo(20, 0, 5), ReturnHome()])
+    v = FakeVehicle()
+    run(m, v)
+    assert m.phase == Phase.DONE
+    assert (v.s.x, v.s.y) == pytest.approx((0.0, 0.0), abs=0.5)
+
+
+def test_hover_longer_than_leg_timeout_is_not_cut_short():
+    m = Mission([Takeoff(5), Hover(40), Land()], MissionConfig(leg_timeout=5))
+    phases = run(m, FakeVehicle())
+    assert Phase.BRAKE not in phases and m.phase == Phase.DONE
+
+
 def test_waits_while_airborne_or_armed():
-    m = Mission(MissionConfig())
+    m = Mission(square())
     v = FakeVehicle()
     v.s = replace(v.s, armed=True, landed=False)
     for _ in range(20):
@@ -116,18 +183,19 @@ def test_waits_while_airborne_or_armed():
 def test_second_mission_starts_from_offboard_mode():
     # Regression: after a mission PX4 stays in offboard mode and reports
     # pre_flight_checks_pass=false until setpoints arrive again.
-    first = Mission(MissionConfig(waypoints=((5, 0, 5),), hold_time=0.1))
+    plan = [Takeoff(5), GoTo(5, 0, 5), Land()]
+    first = Mission(plan)
     v = FakeVehicle()
     run(first, v)
     assert first.phase == Phase.DONE
     v.s = replace(v.s, offboard=True, preflight_ok=False)
-    second = Mission(MissionConfig(waypoints=((5, 0, 5),), hold_time=0.1))
+    second = Mission(plan)
     run(second, v)
     assert second.phase == Phase.DONE
 
 
 def test_not_ready_times_out():
-    m = Mission(MissionConfig(ready_timeout=1.0))
+    m = Mission(square(), MissionConfig(ready_timeout=1.0))
     v = FakeVehicle()
     v.s = replace(v.s, connected=False, position_valid=False)
     run(m, v)
@@ -135,7 +203,7 @@ def test_not_ready_times_out():
 
 
 def test_arm_timeout_disarms():
-    m = Mission(MissionConfig(arm_timeout=1.0))
+    m = Mission(square(), MissionConfig(arm_timeout=1.0))
     v = FakeVehicle()
     v.offboard_allowed = False        # PX4 refuses offboard
     run(m, v)
@@ -144,11 +212,11 @@ def test_arm_timeout_disarms():
 
 
 def test_pilot_takeover_aborts_without_commands():
-    m = Mission(MissionConfig(waypoints=((50, 0, 5),)))
+    m = Mission([Takeoff(5), GoTo(45, 0, 5), Land()])
     v = FakeVehicle()
 
     def takeover(i, mission, vehicle):
-        if mission.phase == Phase.GOTO:
+        if mission.index == 1 and mission.phase == Phase.RUNNING:
             vehicle.s = replace(vehicle.s, offboard=False)  # switched to position mode
     run(m, v, on_tick=takeover)
     assert m.phase == Phase.ABORTED
@@ -156,41 +224,40 @@ def test_pilot_takeover_aborts_without_commands():
 
 
 def test_lost_position_lands():
-    m = Mission(MissionConfig(waypoints=((50, 0, 5),)))
+    m = Mission([Takeoff(5), GoTo(45, 0, 5), Land()])
     v = FakeVehicle()
 
     def lose(i, mission, vehicle):
-        if mission.phase == Phase.GOTO:
+        if mission.index == 1:
             vehicle.s = replace(vehicle.s, position_valid=False)
-    phases = run(m, v, max_ticks=400, on_tick=lose)
-    assert Phase.LAND in phases
+    phases = run(m, v, max_ticks=600, on_tick=lose)
+    assert Phase.LAND in phases and Phase.BRAKE not in phases
     assert Command.LAND in v.commands
 
 
 def test_land_request_during_flight_brakes_first():
-    m = Mission(MissionConfig(waypoints=((50, 0, 5),)))
+    m = Mission([Takeoff(5), GoTo(45, 0, 5), Land()])
     v = FakeVehicle()
-    brake_targets = []
+    brake_points = []
 
     def interrupt(i, mission, vehicle):
-        if mission.phase == Phase.GOTO and vehicle.s.x > 20:
+        if mission.index == 1 and vehicle.s.x > 20 and mission.phase == Phase.RUNNING:
             mission.request_land()
-        if mission.phase == Phase.BRAKE:
-            brake_targets.append(mission.target())
+        if mission.phase == Phase.BRAKE and not brake_points:
+            brake_points.append(vehicle.s.x)
     phases = run(m, v, on_tick=interrupt)
     assert m.phase == Phase.DONE
     assert phases[-3:] == [Phase.BRAKE, Phase.LAND, Phase.DONE]
-    assert Phase.HOLD not in phases
-    assert 20 < brake_targets[0].x < 50     # stops where it was, not at the waypoint
-    assert v.s.x == pytest.approx(brake_targets[0].x)
+    assert 20 < brake_points[0] < 45                  # stopped where it was
+    assert v.s.x == pytest.approx(brake_points[0], abs=1.0)
 
 
 def test_brake_times_out_into_land():
-    m = Mission(MissionConfig(waypoints=((50, 0, 5),), brake_timeout=0.5))
+    m = Mission([Takeoff(5), GoTo(45, 0, 5), Land()], MissionConfig(brake_timeout=0.5))
     v = FakeVehicle()
 
     def interrupt(i, mission, vehicle):
-        if mission.phase == Phase.GOTO:
+        if mission.index == 1:
             mission.request_land()
         if mission.phase == Phase.BRAKE:
             vehicle.s = replace(vehicle.s, speed=5.0)   # never slows down
@@ -199,16 +266,22 @@ def test_brake_times_out_into_land():
 
 
 def test_land_request_before_takeoff_cancels():
-    m = Mission(MissionConfig())
+    m = Mission(square())
     m.request_land()
     run(m, FakeVehicle())
     assert m.phase == Phase.ABORTED
 
 
-def test_leg_timeout_lands():
-    m = Mission(MissionConfig(waypoints=((1000, 0, 5),), leg_timeout=2.0))
-    phases = run(m, FakeVehicle())
-    assert Phase.LAND in phases and Phase.HOLD not in phases
+def test_leg_timeout_brakes_and_lands():
+    m = Mission([Takeoff(5), GoTo(45, 0, 5), Land()],
+                MissionConfig(leg_timeout=0.5, max_speed=1.0))
+    v = FakeVehicle()
+
+    def stall(i, mission, vehicle):        # the vehicle stops making progress
+        if mission.index == 1 and mission.phase == Phase.RUNNING:
+            vehicle.s = replace(vehicle.s, x=0.0)
+    phases = run(m, v, on_tick=stall)
+    assert Phase.BRAKE in phases and m.phase == Phase.DONE
 
 
 def test_waypoints_from_flat():
@@ -217,8 +290,20 @@ def test_waypoints_from_flat():
         waypoints_from_flat([1, 2])
 
 
-def test_config_rejects_bad_values():
-    with pytest.raises(ValueError):
-        MissionConfig(takeoff_altitude=-1)
-    with pytest.raises(ValueError):
-        MissionConfig(waypoints=((0, 0, 0),))
+def test_local_frame_uses_map_coordinates():
+    # Vehicle starts at local (6, 0); the plan names absolute map positions.
+    m = Mission([Takeoff(5), GoTo(6, 3, 5), ReturnHome()], frame='local', start=(6.0, 0.0))
+    v = FakeVehicle()
+    v.s = replace(v.s, x=6.0, y=0.0)
+    run(m, v)
+    assert m.phase == Phase.DONE
+    assert any(sp.y == pytest.approx(3.0) and sp.x == pytest.approx(6.0) for sp in v.setpoints)
+    assert (v.s.x, v.s.y) == pytest.approx((6.0, 0.0), abs=0.5)    # home = takeoff point
+
+
+def test_local_frame_aborts_if_vehicle_moved_since_check():
+    m = Mission([Takeoff(5), Land()], frame='local', start=(0.0, 0.0))
+    v = FakeVehicle()
+    v.s = replace(v.s, x=8.0)
+    run(m, v)
+    assert m.phase == Phase.ABORTED and 'not at the start' in m.failure

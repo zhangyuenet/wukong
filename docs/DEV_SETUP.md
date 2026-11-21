@@ -60,6 +60,9 @@ cd ~/wip/wukong
 # 4. 导入 px4_msgs / px4_ros_com，编译工作空间，并把 env.sh 加入 ~/.bashrc
 ./scripts/setup/04_workspace.sh
 
+# 5. 任务层的 Python 包（Claude API SDK），装在 ~/.local
+./scripts/setup/05_python_deps.sh
+
 # 打开一个新终端后自检
 ./scripts/check_env.sh
 ```
@@ -75,13 +78,25 @@ cd ~/wip/wukong
 **终端 1：一条命令启动仿真**
 
 ```bash
-./scripts/sim.sh               # 带 Gazebo 界面
-HEADLESS=1 ./scripts/sim.sh    # 无界面，省 CPU
+./scripts/sim.sh                   # 带相机的 x500 + 房屋世界，带 Gazebo 界面
+HEADLESS=1 ./scripts/sim.sh        # 无界面，省 CPU
+./scripts/sim.sh gz_x500           # 不带相机的机型
+WORLD=default ./scripts/sim.sh     # PX4 自带的空世界
 ```
 
-`sim.sh` 会依次启动 XRCE-DDS Agent 和 PX4 SITL + Gazebo。出现 `pxh>` 提示符
-后，就可以在这里输入 PX4 命令。按 Ctrl+C 或输入 `shutdown`，会把三个进程全部
-停掉。Agent 的日志在 `log/sim/agent.log`。
+`sim.sh` 会依次启动 XRCE-DDS Agent、PX4 SITL + Gazebo，机型带相机时还会启动
+相机桥，把图像发到 ROS 2 话题 `/camera/image_raw`。出现 `pxh>` 提示符后，就可以
+在这里输入 PX4 命令。按 Ctrl+C 或输入 `shutdown`，会把所有进程停掉。日志在
+`log/sim/`。
+
+仿真世界 `wukong_house` 在 [sim/worlds/](../sim/worlds/)，起飞点以北 15 米有一栋
+房屋，南侧水槽里有落叶，北侧水槽是干净的。PX4 只从自己的目录加载世界文件，
+`sim.sh` 会把本仓库的世界文件链接过去。
+
+**相机需要显示器**：VMware 里用的 ogre1 渲染引擎只能通过 X 显示器（GLX）渲染，
+即使 `HEADLESS=1` 也一样。在桌面的终端里运行没有问题；通过 SSH 或在没有
+`DISPLAY` 的环境中运行时，Gazebo 会报 `Unable to open display` 并崩溃。这种情况
+下先设置 `export DISPLAY=:0`（需要桌面已登录），或者改用不带相机的 `gz_x500`。
 
 **终端 2：ROS 2**
 
@@ -130,7 +145,43 @@ ros2 run wukong_flight fly_mission --ros-args -p waypoints:="[20.0, 0.0, 8.0]"  
 > 启动后设置：用 `PX4_PARAM_NAV_DLL_ACT=0` 环境变量在启动时设置不会生效。
 > **这一设置只用于仿真，真机必须保留数据链丢失保护。**
 
-## 7. 常见问题
+## 7. 用一句话完成任务（M1）
+
+`wukong_mission` 功能包的 `run_task` 把一句话交给 Claude 规划成技能序列，飞完后
+汇总照片判断结果。先把 Claude API 密钥写进仓库根目录的 `.env`（参考
+`.env.example`，`.env` 不会被提交）：
+
+```bash
+ANTHROPIC_API_KEY=sk-ant-...
+```
+
+仿真启动后，在终端 2 中：
+
+```bash
+colcon build --symlink-install            # 第一次需要编译 wukong_mission
+
+ros2 run wukong_mission run_task "帮我检查一下面前这栋房子的水槽，需要清理的地方拍照片给我"
+ros2 run wukong_mission run_task --offline "任意一句话"   # 不联网：固定计划 + 不判断照片
+```
+
+一次任务的过程：
+
+1. 读取无人机当前位置。
+2. **在地面上规划**：Claude 根据地图（[sim_house.yaml](../src/wukong_mission/config/sim_house.yaml)）
+   把这句话变成技能序列。计划必须通过飞行前检查（高度、距离、与房屋保持 2 米
+   以上），不通过就把错误反馈给 Claude 重试一次，仍不通过就**不起飞**。
+3. **飞行**：按计划执行。每拍一张照片，就在后台线程里交给 Claude 判断，飞行
+   不等待结果。
+4. 降落后等待判断结果，写出报告。
+
+照片和报告在 `log/missions/<时间>/`（`report.md` 给人看，`report.json` 给程序用）。
+`log/` 不会被提交。
+
+技能有：起飞、飞到某点（可以指定朝向某个点）、悬停、拍照、返航降落、原地降落。
+飞行速度限制在 3 m/s。网络或 API 出错时：规划阶段出错就不起飞；判断阶段出错，
+报告里这张照片标为“未判断”，飞行不受影响。
+
+## 8. 常见问题
 
 **Gazebo 三维视图一片灰色，看不到地面和无人机**
 
@@ -174,6 +225,19 @@ setuptools，与 ROS 2 用 apt 安装的版本冲突。可以用
 
 上一次仿真的 Gazebo 服务器还在运行。`pgrep -af '^gz sim'` 查看，用
 `pkill -f '^gz sim'` 结束后再启动。
+
+**磁盘被 PX4 日志写满**
+
+PX4 SITL 的启动脚本默认设置 `SDLOG_MODE=1`，意思是从启动开始记录日志，直到
+第一次上锁。仿真启动后如果一直不起飞，日志就会一直写下去，速度约 1 GB/小时。
+仿真曾经空转两天，写出了一个 44 GB 的 `.ulg` 文件。
+
+现在 `sim.sh` 在 PX4 启动后把 `SDLOG_MODE` 改为 0，并重启 logger，只在解锁期间
+记录日志，每次飞行约 10 MB。日志在
+`$PX4_DIR/build/px4_sitl_default/rootfs/log/`，超过 5 GB 时 `sim.sh` 启动时会提醒。
+可以随时整个删除。
+
+不用仿真时记得关掉，`pgrep -af 'px4|gz sim'` 可以检查是否还有残留进程。
 
 **在没有终端的环境里运行 PX4（脚本、CI）**
 

@@ -1,7 +1,7 @@
 # Copyright 2026 Yue Zhang
 # SPDX-License-Identifier: Apache-2.0
 """
-Takeoff -> fly to waypoints -> land, as a pure state machine.
+Execute a plan of skills (see skills.py), as a pure state machine.
 
 This module has no ROS imports on purpose: the node feeds it a VehicleState
 snapshot on every tick and executes the Output it returns. That keeps the flight
@@ -9,11 +9,9 @@ logic testable without a simulator (see test/test_mission.py).
 本模块刻意不依赖 ROS：节点每个周期把飞机状态传进来，再执行返回的输出。
 这样飞行逻辑不需要仿真器也能测试。
 
-Frames: PX4 local NED (x north, y east, z down, metres). Mission targets are
-given relative to the takeoff point as (north, east, altitude-up), and converted
-here, so that nobody has to write a negative number to mean "up".
-坐标系：PX4 本地 NED（z 向下）。航点用相对起飞点的（北, 东, 高度）表示，
-高度向上为正，在本模块内转换成 NED。
+Frames: PX4 local NED (x north, y east, z down, metres). Plans are written
+relative to the takeoff point as (north, east, altitude-up) and converted here.
+坐标系：PX4 本地 NED（z 向下）。计划用相对起飞点的（北, 东, 高度）表示，在这里换算。
 """
 
 from dataclasses import dataclass, field
@@ -21,14 +19,15 @@ import enum
 import math
 from typing import List, Optional, Sequence, Tuple
 
+from .skills import (check_plan, describe, GoTo, Hover, Land, Limits, ReturnHome, Skill,
+                     Takeoff, TakePhoto)
+
 
 class Phase(enum.Enum):
     WAIT_READY = 'wait_ready'   # waiting for PX4 to report a valid, landed vehicle
     PRESTREAM = 'prestream'     # streaming setpoints; PX4 requires this before offboard
     ARMING = 'arming'           # asked for offboard + arm, waiting for both
-    TAKEOFF = 'takeoff'         # climbing straight up above the takeoff point
-    GOTO = 'goto'               # flying to waypoint [index]
-    HOLD = 'hold'               # hovering at waypoint [index]
+    RUNNING = 'running'         # executing plan[index]
     BRAKE = 'brake'             # stopping where we are before landing
     LAND = 'land'               # PX4 auto-land, we only watch
     DONE = 'done'               # landed and disarmed
@@ -52,7 +51,7 @@ class VehicleState:
     x: float = 0.0
     y: float = 0.0
     z: float = 0.0
-    heading: float = 0.0         # radians
+    heading: float = 0.0         # radians, 0 = north, +pi/2 = east
     speed: float = 0.0           # m/s, 3D
     armed: bool = False
     offboard: bool = False       # nav_state == OFFBOARD
@@ -78,31 +77,35 @@ class Output:
     setpoint: Optional[Setpoint] = None   # None: do not stream offboard setpoints
     commands: List[Command] = field(default_factory=list)
     events: List[str] = field(default_factory=list)   # human-readable log lines
+    photo: Optional[str] = None           # take a photo now, with this label
 
 
 @dataclass(frozen=True)
 class MissionConfig:
-    takeoff_altitude: float = 5.0          # m above the takeoff point
-    # (north, east, altitude) in metres, relative to the takeoff point
-    waypoints: Tuple[Tuple[float, float, float], ...] = ()
-    hold_time: float = 3.0                 # s to hover at each waypoint
     tolerance: float = 0.5                 # m, distance that counts as "reached"
+    yaw_tolerance: float = 0.1             # rad (~6 deg)
+    max_speed: float = 3.0                 # m/s, how fast the setpoint moves
+    settle_speed: float = 0.3              # m/s, must be this still to take a photo
+    photo_timeout: float = 5.0             # s, give up on one photo after this
     prestream_time: float = 1.0            # s of setpoints before asking for offboard
     command_retry: float = 1.0             # s between repeated mode/arm/land commands
     ready_timeout: float = 60.0            # s to wait for PX4 to be ready
     arm_timeout: float = 10.0
-    leg_timeout: float = 60.0              # s allowed per takeoff/goto leg
+    leg_timeout: float = 30.0              # s per leg, on top of distance / max_speed
     brake_speed: float = 0.3               # m/s, slow enough to start landing
     brake_timeout: float = 5.0             # s, land anyway after this long
 
     def __post_init__(self) -> None:
-        if self.takeoff_altitude <= 0:
-            raise ValueError('takeoff_altitude must be positive')
-        if self.tolerance <= 0:
-            raise ValueError('tolerance must be positive')
-        for wp in self.waypoints:
-            if len(wp) != 3 or wp[2] <= 0:
-                raise ValueError(f'bad waypoint {wp}: need (north, east, altitude>0)')
+        if self.tolerance <= 0 or self.max_speed <= 0:
+            raise ValueError('tolerance and max_speed must be positive')
+
+
+class PlanRejected(ValueError):
+    """The plan failed check_plan(); the vehicle will not arm."""
+
+    def __init__(self, errors: Sequence[str]) -> None:
+        super().__init__('plan rejected: ' + '; '.join(errors))
+        self.errors = list(errors)
 
 
 def waypoints_from_flat(values: Sequence[float]) -> Tuple[Tuple[float, float, float], ...]:
@@ -114,22 +117,66 @@ def waypoints_from_flat(values: Sequence[float]) -> Tuple[Tuple[float, float, fl
         for i in range(0, len(values), 3))
 
 
-FLYING_PHASES = (Phase.TAKEOFF, Phase.GOTO, Phase.HOLD, Phase.BRAKE)
+def waypoint_plan(takeoff_altitude: float, waypoints, hold_time: float) -> List[Skill]:
+    """Takeoff, visit each (north, east, altitude) and hover there, then land."""
+    plan: List[Skill] = [Takeoff(takeoff_altitude)]
+    for north, east, alt in waypoints:
+        plan += [GoTo(north, east, alt), Hover(hold_time)]
+    plan.append(Land())
+    return plan
+
+
+def _wrap(angle: float) -> float:
+    return (angle + math.pi) % (2 * math.pi) - math.pi
+
+
+FLYING_PHASES = (Phase.RUNNING, Phase.BRAKE)
 
 
 class Mission:
-    """Takeoff, visit each waypoint, land. Call step() at a fixed rate (>= 10 Hz)."""
+    """Run a checked plan. Call step() at a fixed rate (>= 10 Hz)."""
 
-    def __init__(self, config: MissionConfig) -> None:
+    def __init__(self, plan: Sequence[Skill], config: MissionConfig = MissionConfig(),
+                 limits: Limits = Limits(), frame: str = 'takeoff',
+                 start: Optional[Tuple[float, float]] = None) -> None:
+        """
+        Check the plan; raise PlanRejected if it may not fly.
+
+        frame 'takeoff': north/east relative to the takeoff point.
+        frame 'local': north/east in PX4's local frame (as on a map); start must
+        then be the vehicle's current (north, east), and the mission aborts
+        before arming if the vehicle is no longer there.
+        frame='local' 时 start 是飞机当前位置；起飞前飞机若已不在那里则放弃任务。
+        """
+        if frame not in ('takeoff', 'local'):
+            raise ValueError(f'unknown frame {frame}')
+        if frame == 'local' and start is None:
+            raise ValueError("frame 'local' needs the start position")
+        self.frame = frame
+        self.start = (0.0, 0.0) if frame == 'takeoff' else start
+        check = check_plan(plan, limits, self.start)
+        if not check.ok:
+            raise PlanRejected(check.errors)
+        self.plan = list(plan)
         self.config = config
         self.phase = Phase.WAIT_READY
-        self.index = 0                      # current waypoint
-        self._phase_start: Optional[float] = None
-        self._last_command_t = -math.inf
-        self._home: Optional[Setpoint] = None
-        self._land_requested = False
-        self._brake_point: Optional[Setpoint] = None
+        self.index = 0                      # current skill
         self.failure: Optional[str] = None  # why the mission did not complete
+        self.photos: List[Tuple[str, bool]] = []   # (label, taken)
+        self._phase_start: Optional[float] = None
+        self._skill_start = 0.0
+        self._leg_limit = math.inf
+        self._last_command_t = -math.inf
+        self._last_t: Optional[float] = None
+        self._home: Optional[Setpoint] = None
+        self._target: Optional[Setpoint] = None     # where the current skill goes
+        self._carrot: Optional[Setpoint] = None     # setpoint sent, moving at max_speed
+        self._photo_asked_t: Optional[float] = None
+        self._photo_done = False
+        self._photo_ok = False
+        self._land_requested = False
+
+    # -- public -------------------------------------------------------------
 
     @property
     def finished(self) -> bool:
@@ -139,14 +186,25 @@ class Mission:
         """Ask to stop the mission and land (e.g. on Ctrl+C). Applied on the next step."""
         self._land_requested = True
 
+    def photo_done(self, ok: bool = True) -> None:
+        """Tell the mission the photo it asked for has been taken (or failed)."""
+        self._photo_done = True
+        self._photo_ok = ok
+
+    def to_ned(self, north: float, east: float, altitude: float) -> Tuple[float, float, float]:
+        """Plan coordinates -> PX4 local NED setpoint."""
+        assert self._home is not None
+        if self.frame == 'local':
+            return north, east, self._home.z - altitude
+        return self._home.x + north, self._home.y + east, self._home.z - altitude
+
     # -- helpers ------------------------------------------------------------
 
     def _enter(self, phase: Phase, s: VehicleState, out: Output, why: str = '') -> None:
         self.phase = phase
         self._phase_start = s.t
         self._last_command_t = -math.inf
-        label = phase.value + (f' {self.index + 1}' if phase in (Phase.GOTO, Phase.HOLD) else '')
-        out.events.append(f'-> {label}' + (f' ({why})' if why else ''))
+        out.events.append(f'-> {phase.value}' + (f' ({why})' if why else ''))
 
     def _elapsed(self, s: VehicleState) -> float:
         return s.t - (self._phase_start if self._phase_start is not None else s.t)
@@ -161,24 +219,6 @@ class Mission:
         self.failure = why
         self._enter(Phase.ABORTED, s, out, why)
 
-    def target(self) -> Setpoint:
-        """Setpoint for the current phase, in PX4 local NED."""
-        assert self._home is not None
-        h = self._home
-        if self.phase in (Phase.GOTO, Phase.HOLD):
-            north, east, alt = self.config.waypoints[self.index]
-            return Setpoint(h.x + north, h.y + east, h.z - alt, h.yaw)
-        if self.phase == Phase.BRAKE:
-            assert self._brake_point is not None
-            return self._brake_point
-        if self.phase == Phase.TAKEOFF:
-            return Setpoint(h.x, h.y, h.z - self.config.takeoff_altitude, h.yaw)
-        return h
-
-    @staticmethod
-    def _distance(s: VehicleState, sp: Setpoint) -> float:
-        return math.dist((s.x, s.y, s.z), (sp.x, sp.y, sp.z))
-
     def _brake(self, s: VehicleState, out: Output, why: str) -> None:
         """
         Hold the current position until the vehicle has stopped, then land.
@@ -187,18 +227,69 @@ class Mission:
         in simulation a stop at 7 m/s drifted 30 m before touchdown.
         PX4 的降落模式不会先刹车，7 m/s 时中断会再滑出约 30 米，所以先悬停再降落。
         """
-        assert self._home is not None
-        self._brake_point = Setpoint(s.x, s.y, s.z, self._home.yaw)
+        assert self._target is not None
+        here = Setpoint(s.x, s.y, s.z, self._target.yaw)
+        self._target = self._carrot = here
         self._enter(Phase.BRAKE, s, out, why)
 
-    def _next_leg(self, s: VehicleState, out: Output) -> None:
-        """After takeoff or a hold: go to the next waypoint, or land."""
-        if self.phase == Phase.HOLD:
-            self.index += 1
-        if self.index < len(self.config.waypoints):
-            self._enter(Phase.GOTO, s, out)
+    def _start_skill(self, s: VehicleState, out: Output) -> None:
+        """Begin plan[index]: set the target, or hand over to landing."""
+        assert self._target is not None
+        skill = self.plan[self.index]
+        self._skill_start = s.t
+        self._photo_asked_t = None
+        self._photo_done = False
+        out.events.append(f'skill {self.index + 1}/{len(self.plan)}: {describe(skill)}')
+        cur = self._target
+        if isinstance(skill, Takeoff):
+            x, y, z = self.to_ned(0.0, 0.0, skill.altitude)
+            self._target = Setpoint(x, y, z, cur.yaw)
+        elif isinstance(skill, GoTo):
+            x, y, z = self.to_ned(skill.north, skill.east, skill.altitude)
+            yaw = cur.yaw
+            if skill.look_at is not None:
+                lx, ly, _ = self.to_ned(skill.look_at[0], skill.look_at[1], 0.0)
+                if math.hypot(lx - x, ly - y) > 0.1:
+                    yaw = math.atan2(ly - y, lx - x)   # NED: 0 = north, pi/2 = east
+            self._target = Setpoint(x, y, z, yaw)
+        elif isinstance(skill, ReturnHome):
+            assert self._home is not None
+            self._target = Setpoint(self._home.x, self._home.y, cur.z, cur.yaw)
+        elif isinstance(skill, Land):
+            self._enter(Phase.LAND, s, out, 'plan complete')
+            return
+        dist = math.dist((s.x, s.y, s.z), (self._target.x, self._target.y, self._target.z))
+        self._leg_limit = self.config.leg_timeout + dist / self.config.max_speed
+        if isinstance(skill, Hover):
+            self._leg_limit += skill.seconds
+
+    def _next_skill(self, s: VehicleState, out: Output) -> None:
+        self.index += 1
+        if self.index < len(self.plan):
+            self._start_skill(s, out)
+        else:   # check_plan guarantees a terminal skill, but be safe
+            self._enter(Phase.LAND, s, out, 'plan complete')
+
+    def _arrived(self, s: VehicleState) -> bool:
+        t, c = self._target, self._carrot
+        assert t is not None and c is not None
+        return ((c.x, c.y, c.z) == (t.x, t.y, t.z)
+                and math.dist((s.x, s.y, s.z), (t.x, t.y, t.z)) < self.config.tolerance
+                and abs(_wrap(s.heading - t.yaw)) < self.config.yaw_tolerance)
+
+    def _move_carrot(self, s: VehicleState) -> None:
+        """Move the published setpoint towards the target at max_speed."""
+        t, c = self._target, self._carrot
+        assert t is not None and c is not None
+        dt = 0.0 if self._last_t is None else min(max(s.t - self._last_t, 0.0), 0.2)
+        d = math.dist((c.x, c.y, c.z), (t.x, t.y, t.z))
+        step = self.config.max_speed * dt
+        if d <= step or d < 1e-6:
+            self._carrot = t
         else:
-            self._enter(Phase.LAND, s, out, 'mission complete')
+            k = step / d
+            self._carrot = Setpoint(c.x + k * (t.x - c.x), c.y + k * (t.y - c.y),
+                                    c.z + k * (t.z - c.z), t.yaw)
 
     # -- main loop ----------------------------------------------------------
 
@@ -222,8 +313,8 @@ class Mission:
                 pass
             elif self._land_requested:
                 self._brake(s, out, 'land requested')
-            elif self._elapsed(s) > cfg.leg_timeout and self.phase != Phase.HOLD:
-                self._brake(s, out, 'leg timed out')
+            elif s.t - self._skill_start > self._leg_limit:
+                self._brake(s, out, f'skill {self.index + 1} timed out')
         elif self._land_requested and self.phase in (
                 Phase.WAIT_READY, Phase.PRESTREAM, Phase.ARMING):
             if s.armed:
@@ -233,7 +324,13 @@ class Mission:
         if self.phase == Phase.WAIT_READY:
             # PX4 runs its own checks when we ask it to arm. PX4 解锁时自己会做检查。
             if s.connected and s.position_valid and not s.armed and s.landed:
+                if self.frame == 'local' and math.hypot(
+                        s.x - self.start[0], s.y - self.start[1]) > 1.0:
+                    self._abort(s, out, f'vehicle at ({s.x:.1f}, {s.y:.1f}) is not at the '
+                                        f'start the plan was checked for {self.start}')
+                    return out
                 self._home = Setpoint(s.x, s.y, s.z, s.heading)
+                self._target = self._carrot = self._home
                 self._enter(Phase.PRESTREAM, s, out,
                             f'home at x={s.x:.1f} y={s.y:.1f} z={s.z:.1f}')
             elif self._elapsed(s) > cfg.ready_timeout:
@@ -246,7 +343,8 @@ class Mission:
 
         elif self.phase == Phase.ARMING:
             if s.armed and s.offboard:
-                self._enter(Phase.TAKEOFF, s, out)
+                self._enter(Phase.RUNNING, s, out)
+                self._start_skill(s, out)
             elif self._elapsed(s) > cfg.arm_timeout:
                 if s.armed:
                     out.commands.append(Command.DISARM)
@@ -258,17 +356,8 @@ class Mission:
                 if not s.armed:
                     out.commands.append(Command.ARM)
 
-        elif self.phase == Phase.TAKEOFF:
-            if self._distance(s, self.target()) < cfg.tolerance:
-                self._next_leg(s, out)
-
-        elif self.phase == Phase.GOTO:
-            if self._distance(s, self.target()) < cfg.tolerance:
-                self._enter(Phase.HOLD, s, out)
-
-        elif self.phase == Phase.HOLD:
-            if self._elapsed(s) >= cfg.hold_time:
-                self._next_leg(s, out)
+        elif self.phase == Phase.RUNNING:
+            self._run_skill(s, out)
 
         elif self.phase == Phase.BRAKE:
             if s.speed < cfg.brake_speed:
@@ -285,5 +374,36 @@ class Mission:
         # Keep streaming setpoints in every phase where offboard is (or will be) active.
         # 在需要 offboard 的阶段持续发送设定点，PX4 收不到会触发失效保护。
         if self.phase in (Phase.PRESTREAM, Phase.ARMING) + FLYING_PHASES:
-            out.setpoint = self.target()
+            self._move_carrot(s)
+            out.setpoint = self._carrot
+        self._last_t = s.t
         return out
+
+    def _run_skill(self, s: VehicleState, out: Output) -> None:
+        skill = self.plan[self.index]
+        cfg = self.config
+        if isinstance(skill, (Takeoff, GoTo)):
+            if self._arrived(s):
+                self._next_skill(s, out)
+        elif isinstance(skill, ReturnHome):
+            if self._arrived(s):
+                self._enter(Phase.LAND, s, out, 'back home')
+        elif isinstance(skill, Hover):
+            if s.t - self._skill_start >= skill.seconds:
+                self._next_skill(s, out)
+        elif isinstance(skill, TakePhoto):
+            if self._photo_asked_t is None:
+                if s.speed < cfg.settle_speed and self._arrived(s):
+                    self._photo_asked_t = s.t
+                    out.photo = skill.label
+            elif self._photo_done:
+                self.photos.append((skill.label, self._photo_ok))
+                if not self._photo_ok:
+                    out.events.append(f'photo "{skill.label}" failed, continuing')
+                self._next_skill(s, out)
+            elif s.t - self._photo_asked_t > cfg.photo_timeout:
+                self.photos.append((skill.label, False))
+                out.events.append(f'photo "{skill.label}" timed out, continuing')
+                self._next_skill(s, out)
+        elif isinstance(skill, Land):   # handled in _start_skill, kept for safety
+            self._enter(Phase.LAND, s, out, 'plan complete')

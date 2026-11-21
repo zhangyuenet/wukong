@@ -35,6 +35,16 @@ check "px4_msgs source"   test -d "$ROOT/src/third_party/px4_msgs"
 check "workspace built"   test -f "$ROOT/install/setup.bash"
 check "env.sh in ~/.bashrc" grep -qF "scripts/env.sh" ~/.bashrc
 
+echo "Mission layer / 任务层"
+check "anthropic SDK ${ANTHROPIC_SDK_VERSION}" bash -c "python3 -c 'import anthropic; print(anthropic.__version__)' | grep -qx '${ANTHROPIC_SDK_VERSION}' && echo ok"
+check "Brotli ${BROTLI_VERSION} (for the SDK)" bash -c "python3 -c 'import brotli; print(brotli.__version__)' | grep -qx '${BROTLI_VERSION}' && echo ok"
+check "Pillow"            bash -c "python3 -c 'import PIL; print(PIL.__version__)'"
+if [ -n "${ANTHROPIC_API_KEY:-}" ] || grep -qE '^ANTHROPIC_API_KEY=.+' "$ROOT/.env" 2>/dev/null; then
+    ok "Claude API key (environment or .env)"
+else
+    echo "  [--]   Claude API key not set: run_task needs it, run_task --offline does not"
+fi
+
 echo
 echo "Passed: $pass   Failed: $fail"
 [ "$fail" -eq 0 ]
