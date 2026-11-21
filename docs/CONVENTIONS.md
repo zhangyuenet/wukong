@@ -35,7 +35,7 @@ wukong/                   仓库本身就是 colcon 工作空间
 
 - **Python（rclpy）**：任务管理、技能、与大模型的交互。迭代快，大模型的 SDK 也
   以 Python 为主。10–50 Hz 的控制环路用 Python 也够用。
-- **C++（rclcpp）**：等到出现 Python 跑不动的环节再用，预计是 M3 的深度图处理和
+- **C++（rclcpp）**：等到出现 Python 跑不动的环节再用，预计是 M4 的深度图处理和
   视觉定位。届时单独建包。
 
 ## 3. Python 风格

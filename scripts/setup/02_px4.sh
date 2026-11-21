@@ -17,8 +17,8 @@ else
 fi
 
 echo "==> Running PX4 ubuntu.sh (simulation only, no NuttX toolchain) / 运行 PX4 依赖安装脚本"
-# --no-nuttx: the hardware toolchain is not needed until M4 (real drone).
-# --no-nuttx：真机固件工具链到 M4 阶段才需要。
+# --no-nuttx: the hardware toolchain is not needed until M5 (real drone).
+# --no-nuttx：真机固件工具链到 M5 阶段才需要。
 bash "$PX4_DIR/Tools/setup/ubuntu.sh" --no-nuttx
 
 # ubuntu.sh appends `export SVGA_VGPU10=0` to ~/.profile inside VMware. That was a
