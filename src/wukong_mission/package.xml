@@ -10,6 +10,7 @@
   <exec_depend>rclpy</exec_depend>
   <exec_depend>ament_index_python</exec_depend>
   <exec_depend>wukong_flight</exec_depend>
+  <exec_depend>wukong_perception</exec_depend>
   <exec_depend>python3-yaml</exec_depend>
   <exec_depend>python3-pil</exec_depend>
   <!-- anthropic and pydantic 2 are not in apt: scripts/setup/05_python_deps.sh -->

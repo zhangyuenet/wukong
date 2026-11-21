@@ -9,7 +9,7 @@ judgement never touches the flight. It only changes the report.
 """
 
 import base64
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import io
 from typing import Literal
 
@@ -37,6 +37,7 @@ class Verdict:
     confidence: str
     findings: str
     where: str = ''
+    extra: dict = field(default_factory=dict)   # e.g. which gutter segment it shows
 
 
 SYSTEM_PROMPT = """\

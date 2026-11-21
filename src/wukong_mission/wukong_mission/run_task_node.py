@@ -33,8 +33,10 @@ from wukong_flight.px4_link import Px4Link
 from wukong_flight.skills import describe
 
 from . import llm
+from .gutter_task import GutterTask
 from .judge import ClaudeJudge, FakeJudge, Verdict
-from .planner import ClaudePlanner, Plan, PlanningError, ScriptedPlanner
+from .planner import (ClaudePlanner, GutterPlanner, OfflineGutterPlanner, Plan, PlanningError,
+                      ScriptedPlanner)
 from .report import summary_line, write_report
 from .world import load_world
 
@@ -56,6 +58,8 @@ def _parse_args(argv):
     p.add_argument('--offline', action='store_true',
                    help='scripted planner and fake judge: no network, no API key')
     p.add_argument('--world', default=None, help='map file (default: the sim house)')
+    p.add_argument('--scenario', default=None,
+                   help='use the rough map of sim scenario NAME (sim/generated/NAME/map.yaml)')
     p.add_argument('--model', default=llm.DEFAULT_MODEL)
     p.add_argument('--effort', default='medium', choices=['low', 'medium', 'high'])
     p.add_argument('--out', default=None, help='output directory for photos and report')
@@ -94,9 +98,65 @@ def _collect(futures: List[Tuple[str, str, Future]], timeout: float) -> List[Ver
     return verdicts
 
 
+def _run_gutters(args, world, start, out_dir, say) -> int:
+    """M2: survey a roughly known house, then photograph and judge every gutter segment."""
+    try:
+        if args.offline:
+            planner, judge = OfflineGutterPlanner(world), FakeJudge()
+        else:
+            planner = GutterPlanner(world, args.model)
+            judge = ClaudeJudge(args.model, args.effort)
+        say(f'[run_task] understanding: "{args.instruction}"')
+        request = planner.request(args.instruction)
+        task = GutterTask(world, request, start, out_dir, judge, args.instruction, log=say)
+    except (llm.LlmError, PlanningError, ValueError) as e:
+        say(f'[run_task] no takeoff: {e}')
+        write_report(out_dir, args.instruction, None, False, str(e), [])
+        return 2
+    except KeyboardInterrupt:
+        say('[run_task] cancelled during planning, no takeoff')
+        return 2
+    sides = ', '.join(request.sides) or 'all'
+    say(f'[run_task] task: {request.understood} (house "{request.house}", gutters: {sides})')
+    skills = task.plan()
+    say('[run_task] survey plan, the inspection is planned in flight after the survey:')
+    for i, s in enumerate(skills, 1):
+        say(f'           {i:2d}. {describe(s)}')
+    try:
+        node = MissionNode(skills, MissionConfig(), world.limits, out_dir, name='run_task',
+                           frame='local', start=start)
+    except PlanRejected as e:
+        say(f'[run_task] no takeoff: {e}')
+        return 2
+    task.attach(node)
+    flight_ok = spin_mission(node)
+    mission = node.mission
+    note = mission.failure or ''
+    for label, accepted, errors in mission.decisions:
+        if not accepted:
+            note = (note + '; ' if note else '') + f'{label}: ' + '; '.join(errors[:3])
+    node.destroy_node()
+
+    if task.pending():
+        say(f'[run_task] waiting for {task.pending()} photo judgement(s)...')
+    try:
+        verdicts = task.collect(args.judge_timeout)
+    except KeyboardInterrupt:
+        verdicts = task.collect(0.0)
+    plan = Plan(request.understood, list(mission.plan))
+    md = write_report(out_dir, args.instruction, plan, flight_ok, note, verdicts)
+    say(f'[run_task] {summary_line(verdicts)}')
+    say(f'[run_task] report: {md}')
+    return 0 if flight_ok and mission.decisions and mission.decisions[-1][1] else 1
+
+
 def main(argv=None) -> int:
     args = _parse_args(remove_ros_args(sys.argv if argv is None else argv)[1:])
     out_dir = args.out or _default_out()
+    os.makedirs(out_dir, exist_ok=True)
+    if args.scenario:
+        args.world = os.path.join(os.environ.get('WUKONG_ROOT', '.'), 'sim', 'generated',
+                                  args.scenario, 'map.yaml')
     world = load_world(args.world or _default_world())
     say = functools.partial(print, flush=True)   # keep order with ROS logs
 
@@ -108,6 +168,8 @@ def main(argv=None) -> int:
             say('[run_task] no vehicle position from PX4 (is ./scripts/sim.sh running?)')
             return 2
         say(f'[run_task] drone at north {start[0]:.1f}, east {start[1]:.1f}')
+        if world.rough_houses:
+            return _run_gutters(args, world, start, out_dir, say)
 
         # 2. Plan, on the ground. 在地面上完成规划。
         try:
@@ -135,7 +197,7 @@ def main(argv=None) -> int:
         pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix='judge')
         futures: List[Tuple[str, str, Future]] = []
 
-        def on_photo(label: str, path: str) -> None:
+        def on_photo(label: str, path: str, pose) -> None:
             futures.append((label, path, pool.submit(
                 judge.judge, args.instruction, label, plan.questions.get(label, ''), path)))
 

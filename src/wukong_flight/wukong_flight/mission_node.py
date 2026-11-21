@@ -14,6 +14,7 @@ Ctrl+C during flight brakes and lands; a second Ctrl+C exits at once
 
 import os
 import re
+import threading
 from typing import Callable, Optional, Sequence, Tuple
 
 import rclpy
@@ -21,9 +22,18 @@ from rclpy.node import Node
 
 from .mission import Mission, MissionConfig, Phase
 from .px4_link import Px4Link
-from .skills import Limits, Skill, TakePhoto
+from .skills import Decide, Limits, Skill, TakePhoto
 
-PhotoCallback = Callable[[str, str], None]   # (label, path)
+# Vehicle pose when a scan or decision is requested: (north, east, altitude, heading,
+# roll, pitch), in plan coordinates; angles in radians, heading 0 north, pi/2 east.
+Pose = Tuple[float, float, float, float, float, float]
+# (label, pose, done): capture a depth frame, then call done(ok). Must not block.
+ScanCallback = Callable[[str, Pose, Callable[[bool], None]], None]
+# (label, pose) -> (skills or None, new limits or None, note). Runs in a worker
+# thread, so it may take seconds (perception); the vehicle holds position meanwhile.
+DecideCallback = Callable[[str, Pose], Tuple[Optional[list], Optional[Limits], str]]
+# (label, path, pose when the photo was requested)
+PhotoCallback = Callable[[str, str, Pose], None]
 
 
 def _slug(text: str) -> str:
@@ -36,15 +46,21 @@ class MissionNode(Node):
                  limits: Limits = Limits(), output_dir: str = '.',
                  on_photo: Optional[PhotoCallback] = None, name: str = 'mission',
                  rate_hz: float = 20.0, frame: str = 'takeoff',
-                 start: Optional[Tuple[float, float]] = None) -> None:
+                 start: Optional[Tuple[float, float]] = None,
+                 on_scan: Optional[ScanCallback] = None,
+                 on_decide: Optional[DecideCallback] = None) -> None:
         super().__init__(name)
         # Raises PlanRejected before anything is sent to PX4.
         self.mission = Mission(plan, config, limits, frame, start)
         self.link = Px4Link(self)
         self.output_dir = output_dir
         self.on_photo = on_photo
+        self.on_scan = on_scan
+        self.on_decide = on_decide
+        self._decide_thread: Optional[threading.Thread] = None
         self.camera = None
-        if any(isinstance(s, TakePhoto) for s in plan):
+        # A Decide skill may add photos later, so have the camera ready.
+        if any(isinstance(s, (TakePhoto, Decide)) for s in plan):
             from .camera import Camera   # Pillow only needed when taking photos
             self.camera = Camera(self)
         self._last_report = 0.0
@@ -67,7 +83,11 @@ class MissionNode(Node):
             self.get_logger().info(f'command: {command.value}')
             self.link.send_command(command)
         if out.photo is not None:
-            self._take_photo(out.photo)
+            self._take_photo(out.photo, state)
+        if out.scan is not None:
+            self._scan(out.scan, state)
+        if out.decide is not None:
+            self._decide(out.decide, state)
 
         if state.t - self._last_report >= 2.0 and state.connected:
             self._last_report = state.t
@@ -76,7 +96,35 @@ class MissionNode(Node):
                 f'pos N={state.x:.1f} E={state.y:.1f} alt={-state.z:.1f} '
                 f'speed={state.speed:.1f} armed={state.armed} offboard={state.offboard}')
 
-    def _take_photo(self, label: str) -> None:
+    def _pose(self, state) -> Pose:
+        return (*self.mission.plan_position(state), state.heading, state.roll, state.pitch)
+
+    def _scan(self, label: str, state) -> None:
+        if self.on_scan is None:
+            self.mission.scan_done(False)
+            return
+        self.on_scan(label, self._pose(state), self.mission.scan_done)
+
+    def _decide(self, label: str, state) -> None:
+        if self.on_decide is None:
+            self.mission.decide_done(None, why='no decision maker')
+            return
+        pose = self._pose(state)
+
+        def work() -> None:
+            try:
+                skills, limits, note = self.on_decide(label, pose)
+            except Exception as e:   # noqa: B902 - any failure: insert nothing, fly on
+                self.get_logger().error(f'decide "{label}" failed: {e!r}')
+                skills, limits, note = None, None, f'error: {e}'
+            self.mission.decide_done(skills, limits, note)
+
+        self.get_logger().info(f'deciding "{label}" (holding position)...')
+        self._decide_thread = threading.Thread(target=work, name='decide', daemon=True)
+        self._decide_thread.start()
+
+    def _take_photo(self, label: str, state) -> None:
+        pose = self._pose(state)
         if self.camera is None:
             self.mission.photo_done(False)
             return
@@ -87,7 +135,7 @@ class MissionNode(Node):
             if ok:
                 self.get_logger().info(f'photo "{label}" saved: {info}')
                 if self.on_photo is not None:
-                    self.on_photo(label, info)
+                    self.on_photo(label, info, pose)
             else:
                 self.get_logger().error(f'photo "{label}" failed: {info}')
             self.mission.photo_done(ok)

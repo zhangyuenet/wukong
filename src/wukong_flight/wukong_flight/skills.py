@@ -65,7 +65,29 @@ class Land:
     """Land where the vehicle is."""
 
 
-Skill = Union[Takeoff, GoTo, Hover, TakePhoto, ReturnHome, Land]
+@dataclass(frozen=True)
+class Scan:
+    """Settle, then capture one depth frame (for perception, not for people)."""
+
+    label: str
+
+
+@dataclass(frozen=True)
+class Decide:
+    """
+    Hold position while the mission layer works out the next skills.
+
+    Typically after scanning: perception turns the scans into geometry, and
+    the next skills are computed from it. They are inserted after this skill
+    only if the rest of the plan, from here, passes check_plan(); otherwise
+    the mission goes on with the skills that were already planned.
+    悬停等待任务层根据感知结果给出后续技能；只有通过检查才插入，否则按原计划继续。
+    """
+
+    label: str
+
+
+Skill = Union[Takeoff, GoTo, Hover, TakePhoto, Scan, Decide, ReturnHome, Land]
 TERMINAL = (ReturnHome, Land)
 
 
@@ -92,13 +114,63 @@ class Box:
 
 
 @dataclass(frozen=True)
+class RotatedBox:
+    """
+    A no-fly box turned to any heading, e.g. a house that is not aligned north.
+
+    length runs along bearing_deg (compass: 0 north, 90 east), width across it.
+    length 沿 bearing_deg 方向（罗盘方位），width 与之垂直。
+    """
+
+    center: Tuple[float, float]     # (north, east)
+    length: float
+    width: float
+    bearing_deg: float
+    top: float
+    name: str = ''
+
+    def inflated(self, margin: float) -> 'RotatedBox':
+        return RotatedBox(self.center, self.length + 2 * margin, self.width + 2 * margin,
+                          self.bearing_deg, self.top + margin, self.name)
+
+    def contains(self, north: float, east: float, altitude: float) -> bool:
+        if altitude > self.top:
+            return False
+        b = math.radians(self.bearing_deg)
+        dn, de = north - self.center[0], east - self.center[1]
+        along = dn * math.cos(b) + de * math.sin(b)
+        across = -dn * math.sin(b) + de * math.cos(b)
+        return abs(along) <= self.length / 2 and abs(across) <= self.width / 2
+
+
+@dataclass(frozen=True)
+class Cylinder:
+    """A round no-fly zone: everything within radius of center, up to top."""
+
+    center: Tuple[float, float]     # (north, east)
+    radius: float
+    top: float
+    name: str = ''
+
+    def inflated(self, margin: float) -> 'Cylinder':
+        return Cylinder(self.center, self.radius + margin, self.top + margin, self.name)
+
+    def contains(self, north: float, east: float, altitude: float) -> bool:
+        return (altitude <= self.top
+                and math.hypot(north - self.center[0], east - self.center[1]) <= self.radius)
+
+
+NoFly = Union[Box, RotatedBox, Cylinder]
+
+
+@dataclass(frozen=True)
 class Limits:
     min_altitude: float = 1.5        # m, lowest allowed except while landing
     max_altitude: float = 20.0       # m
     max_distance: float = 50.0       # m, horizontal, from the takeoff point
     max_hover: float = 60.0          # s, per Hover skill
     max_skills: int = 40
-    no_fly: Tuple[Box, ...] = ()
+    no_fly: Tuple[NoFly, ...] = ()
     margin: float = 2.0              # m, kept from every no-fly box
     sample_step: float = 0.25        # m, resolution of the path check
 
@@ -120,13 +192,16 @@ def _segment_hits(a, b, box: Box, step: float) -> bool:
 
 
 def check_plan(plan: Sequence[Skill], limits: Limits = Limits(),
-               start: Tuple[float, float] = (0.0, 0.0)) -> PlanCheck:
+               start: Tuple[float, float] = (0.0, 0.0),
+               initial: Optional[Tuple[float, float, float]] = None) -> PlanCheck:
     """
     Check a plan before flight. An empty error list means it may fly.
 
     start is the takeoff point in the plan's frame: (0, 0) when the plan is
     relative to the takeoff point. max_distance is measured from start.
-    start 是起飞点在计划坐标系中的位置。
+    initial: check the rest of a plan in flight, starting from the vehicle's
+    current (north, east, altitude); takeoff is then not allowed.
+    start 是起飞点在计划坐标系中的位置。initial 用于飞行中检查剩余计划。
     """
     result = PlanCheck()
     err = result.errors.append
@@ -135,17 +210,17 @@ def check_plan(plan: Sequence[Skill], limits: Limits = Limits(),
         return result
     if len(plan) > limits.max_skills:
         err(f'plan has {len(plan)} skills, the limit is {limits.max_skills}')
-    if not isinstance(plan[0], Takeoff):
+    if initial is None and not isinstance(plan[0], Takeoff):
         err('the first skill must be takeoff')
     if not isinstance(plan[-1], TERMINAL):
         err('the last skill must be land or return_home')
     boxes = [b.inflated(limits.margin) for b in limits.no_fly]
 
     home = (float(start[0]), float(start[1]))
-    pos = (home[0], home[1], 0.0)  # north, east, altitude
+    pos = (home[0], home[1], 0.0) if initial is None else tuple(map(float, initial))
     for i, skill in enumerate(plan, 1):
         where = f'skill {i} ({type(skill).__name__})'
-        if isinstance(skill, Takeoff) and i > 1:
+        if isinstance(skill, Takeoff) and (i > 1 or initial is not None):
             err(f'{where}: takeoff is only allowed as the first skill')
         if isinstance(skill, TERMINAL) and i < len(plan):
             err(f'{where}: nothing may follow land or return_home')
@@ -162,8 +237,8 @@ def check_plan(plan: Sequence[Skill], limits: Limits = Limits(),
             nxt = pos
             if isinstance(skill, Hover) and not 0 <= skill.seconds <= limits.max_hover:
                 err(f'{where}: hover {skill.seconds} s is outside 0..{limits.max_hover} s')
-            if isinstance(skill, TakePhoto) and not skill.label.strip():
-                err(f'{where}: photo label is empty')
+            if isinstance(skill, (TakePhoto, Scan, Decide)) and not skill.label.strip():
+                err(f'{where}: label is empty')
 
         if nxt != pos:
             if not limits.min_altitude <= nxt[2] <= limits.max_altitude:
@@ -201,6 +276,10 @@ def describe(skill: Skill) -> str:
         return f'hover {skill.seconds:.0f} s'
     if isinstance(skill, TakePhoto):
         return f'take photo "{skill.label}"'
+    if isinstance(skill, Scan):
+        return f'depth scan "{skill.label}"'
+    if isinstance(skill, Decide):
+        return f'decide next steps ({skill.label})'
     if isinstance(skill, ReturnHome):
         return 'return home and land'
     return 'land'

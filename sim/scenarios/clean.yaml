@@ -1,0 +1,10 @@
+# Nothing to clean: the report must say so. 全部干净：报告必须说没有问题。
+seed: 3
+house:
+  center: [14.0, -3.0]
+  ridge_bearing_deg: 0       # ridge runs north-south: gutters face east and west
+  length: 11.0
+  depth: 8.0
+gutters:
+  a: [clean, clean, clean, clean]
+  b: [clean, clean, clean, clean]

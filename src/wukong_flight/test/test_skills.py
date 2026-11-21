@@ -67,3 +67,29 @@ def test_start_position_is_used_for_home_and_distance():
                       start=(40, 0)).ok
     # Taking off right next to the house: the climb itself is inside the margin.
     assert not check_plan([Takeoff(5), Land()], LIMITS, start=(10, 0)).ok
+
+
+def test_rotated_box():
+    from wukong_flight.skills import RotatedBox
+    # 10 x 4 box along bearing 45 (north-east), centred at (10, 10).
+    box = RotatedBox((10, 10), 10, 4, 45, 6, 'h')
+    assert box.contains(10 + 3, 10 + 3, 2)          # along the long axis
+    assert not box.contains(10 + 3, 10 - 3, 2)      # 4.2 m across: outside
+    assert not box.contains(10, 10, 7)              # above
+    assert box.inflated(2).contains(10 + 2, 10 - 2, 7)
+
+
+def test_cylinder_and_rotated_box_in_check_plan():
+    from wukong_flight.skills import Cylinder
+    lim = Limits(no_fly=(Cylinder((15, 0), 5, 6, 'tree'),))
+    assert not check_plan([Takeoff(4), GoTo(25, 0, 4), ReturnHome()], lim).ok
+    assert check_plan([Takeoff(9), GoTo(25, 0, 9), ReturnHome()], lim).ok
+
+
+def test_continuation_check_starts_from_current_position():
+    # In flight at (8, 0, 5): the rest of the plan must not start with takeoff
+    # and is checked from there.
+    assert check_plan([GoTo(8, 5, 5), ReturnHome()], LIMITS, initial=(8, 0, 5)).ok
+    assert not check_plan([Takeoff(5), ReturnHome()], LIMITS, initial=(8, 0, 5)).ok
+    errors = check_plan([GoTo(25, 0, 5), ReturnHome()], LIMITS, initial=(8, 0, 5)).errors
+    assert any('no-fly box house' in e for e in errors)

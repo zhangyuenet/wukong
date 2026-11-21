@@ -10,8 +10,9 @@ rest of Wukong talks in terms of VehicleState / Setpoint / Command.
 
 import math
 
-from px4_msgs.msg import (OffboardControlMode, TrajectorySetpoint, VehicleCommand,
-                          VehicleLandDetected, VehicleLocalPosition, VehicleStatus)
+from px4_msgs.msg import (OffboardControlMode, TrajectorySetpoint, VehicleAttitude,
+                          VehicleCommand, VehicleLandDetected, VehicleLocalPosition,
+                          VehicleStatus)
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 
@@ -50,6 +51,8 @@ class Px4Link:
         self._status: VehicleStatus | None = None
         self._position: VehicleLocalPosition | None = None
         self._landed = True
+        self._roll = 0.0
+        self._pitch = 0.0
         self._status_t = -1.0
         self._position_t = -1.0
 
@@ -64,6 +67,9 @@ class Px4Link:
             VehicleLandDetected,
             px4_topic('out', 'vehicle_land_detected', VehicleLandDetected),
             self._on_land_detected, PX4_QOS)
+        node.create_subscription(
+            VehicleAttitude, px4_topic('out', 'vehicle_attitude', VehicleAttitude),
+            self._on_attitude, PX4_QOS)
 
         self._mode_pub = node.create_publisher(
             OffboardControlMode,
@@ -91,6 +97,11 @@ class Px4Link:
     def _on_land_detected(self, msg: VehicleLandDetected) -> None:
         self._landed = bool(msg.landed)
 
+    def _on_attitude(self, msg: VehicleAttitude) -> None:
+        w, x, y, z = (float(v) for v in msg.q)     # Hamilton, body FRD -> NED
+        self._roll = math.atan2(2 * (w * x + y * z), 1 - 2 * (x * x + y * y))
+        self._pitch = math.asin(max(-1.0, min(1.0, 2 * (w * y - z * x))))
+
     def state(self) -> VehicleState:
         t = self._now()
         st, pos = self._status, self._position
@@ -111,6 +122,7 @@ class Px4Link:
             landing=st.nav_state == VehicleStatus.NAVIGATION_STATE_AUTO_LAND,
             landed=self._landed,
             preflight_ok=bool(st.pre_flight_checks_pass),
+            roll=self._roll, pitch=self._pitch,
         )
 
     # -- output -------------------------------------------------------------

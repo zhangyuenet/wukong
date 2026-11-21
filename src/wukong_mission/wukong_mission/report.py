@@ -16,11 +16,35 @@ _ANSWER = {'yes': 'needs attention', 'no': 'OK', 'unclear': 'unclear',
            'error': 'not judged', 'pending': 'not judged (timed out)'}
 
 
+def _segment_summary(verdicts: List[Verdict]) -> str:
+    """Summarise per-segment results, e.g. 'Needs cleaning: south gutter segments 2, 4.'."""
+    bad: dict = {}
+    unknown: dict = {}
+    for v in verdicts:
+        g, i = v.extra['gutter'], v.extra['segment']
+        if v.needs_attention == 'yes':
+            bad.setdefault(g, []).append(i)
+        elif v.needs_attention != 'no':
+            unknown.setdefault(g, []).append(i)
+
+    def fmt(d):
+        return '; '.join(f'{g} segment{"s" if len(ix) > 1 else ""} '
+                         + ', '.join(map(str, sorted(ix))) for g, ix in sorted(d.items()))
+    if not bad and sum(map(len, unknown.values())) == len(verdicts):
+        return f'No segment could be judged: {fmt(unknown)}.'
+    parts = [f'Needs cleaning: {fmt(bad)}.' if bad else 'No gutter segment needs cleaning.']
+    if unknown:
+        parts.append(f'Could not tell: {fmt(unknown)}.')
+    return ' '.join(parts)
+
+
 def summary_line(verdicts: List[Verdict]) -> str:
     bad = [v.label for v in verdicts if v.needs_attention == 'yes']
     unknown = [v.label for v in verdicts if v.needs_attention not in ('yes', 'no')]
     if not verdicts:
         return 'No photos were taken.'
+    if all('gutter' in v.extra for v in verdicts):
+        return _segment_summary(verdicts)
     if len(unknown) == len(verdicts):
         return 'No photo could be judged: ' + ', '.join(unknown) + '.'
     parts = [f'Needs attention: {", ".join(bad)}.' if bad else 'Nothing needs attention.']
@@ -41,6 +65,17 @@ def write_report(out_dir: str, instruction: str, plan: Optional[Plan], flight_ok
                   + (f' ({flight_note})' if flight_note else ''), '',
                   f'**Result:** {summary_line(verdicts)}', '',
                   '## Photos', '']
+    segs = [v for v in verdicts if 'gutter' in v.extra]
+    if segs:
+        lines += ['| Gutter | Segment | Result | Confidence | Findings |',
+                  '|---|---|---|---|---|']
+        for v in sorted(segs, key=lambda v: (v.extra['gutter'], v.extra['segment'])):
+            x = v.extra
+            answer = _ANSWER.get(v.needs_attention, v.needs_attention)
+            findings = v.findings.replace('|', '/')
+            lines.append(f'| {x["gutter"]} | {x["segment"]} of {x["segments"]} | {answer} | '
+                         f'{v.confidence} | {findings} |')
+        lines.append('')
     for v in verdicts:
         rel = os.path.relpath(v.path, out_dir)
         lines += [f'### {v.label}: {_ANSWER.get(v.needs_attention, v.needs_attention)}'

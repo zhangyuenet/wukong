@@ -1,0 +1,14 @@
+# A longer house, turned 30 degrees, off to the north-east, steeper roof.
+# 更长的房屋，转 30 度，在东北方向，屋顶更陡。
+seed: 7
+house:
+  center: [16.0, 6.0]
+  ridge_bearing_deg: 60
+  length: 13.0
+  depth: 7.0
+  wall_height: 3.2
+  roof_pitch_deg: 35
+  map_error: 1.5
+gutters:
+  a: [blocked, clean, clean, leaves, clean]
+  b: [clean, clean, clean, clean, clean]

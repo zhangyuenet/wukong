@@ -223,3 +223,74 @@ def _last_xy(skills, start):
         if isinstance(s, GoTo):
             return s.north, s.east
     return start
+
+
+# -- M2: gutters of a roughly known house ---------------------------------------
+
+Side = Literal['north', 'northeast', 'east', 'southeast', 'south', 'southwest', 'west',
+               'northwest']
+
+
+class GutterTaskSpec(BaseModel):
+    understood: str = Field(description='The task, restated in one sentence')
+    feasible: bool = Field(description='False if this is not a gutter inspection of a '
+                                       'house on the map')
+    reason_if_not: Optional[str] = None
+    house: str = Field(description='Name of the house on the map')
+    sides: List[Side] = Field(
+        description='Only inspect gutters facing these directions; empty list = all gutters')
+
+
+GUTTER_SYSTEM_PROMPT = """\
+You turn a homeowner's request into a gutter inspection task for Wukong, a small \
+quadcopter. The drone knows only roughly where each house is. In flight it scans \
+the house with a depth camera, finds the eaves, and photographs every gutter \
+segment; a vision model then judges each segment. You do not plan coordinates: \
+pick the house and, if the user asked for particular sides, the compass \
+directions those gutters face. Leave sides empty for "all gutters" or when the \
+user gives no direction. Words like "front" or "back" have no direction on this \
+map: leave sides empty and mention it in understood.
+
+If the request is not about inspecting gutters of a house on the map, set \
+feasible to false and explain why in reason_if_not.
+"""
+
+
+class GutterPlanner:
+    """Claude reads the request; geometry is done in flight by code."""
+
+    def __init__(self, world: WorldMap, model: str = llm.DEFAULT_MODEL,
+                 effort: str = 'low', client=None) -> None:
+        self.world = world
+        self.model, self.effort = model, effort
+        self.client = client if client is not None else llm.make_client()
+
+    def request(self, instruction: str):
+        from .gutter_task import GutterRequest
+        text = f'{self.world.describe()}\n\nUser request: {instruction}'
+        spec: GutterTaskSpec = llm.parse(self.client, self.model, GUTTER_SYSTEM_PROMPT,
+                                         [{'type': 'text', 'text': text}], GutterTaskSpec,
+                                         effort=self.effort, max_tokens=4000)
+        if not spec.feasible:
+            raise PlanningError(f'the model says this cannot be done: '
+                                f'{spec.reason_if_not or "no reason given"}')
+        names = [h.name for h in self.world.rough_houses]
+        if spec.house not in names:
+            raise PlanningError(f'the model picked "{spec.house}", which is not on the map '
+                                f'({", ".join(names)})')
+        return GutterRequest(spec.understood, spec.house, list(spec.sides))
+
+
+class OfflineGutterPlanner:
+    """Offline stand-in: all gutters of the first house on the map."""
+
+    def __init__(self, world: WorldMap) -> None:
+        self.world = world
+
+    def request(self, instruction: str):
+        from .gutter_task import GutterRequest
+        if not self.world.rough_houses:
+            raise PlanningError('no house on the map')
+        h = self.world.rough_houses[0]
+        return GutterRequest(f'(offline) inspect all gutters of {h.name}: {instruction}',
+                             h.name, [])

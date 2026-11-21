@@ -6,6 +6,8 @@
 #   HEADLESS=1 ./scripts/sim.sh       # no GUI, saves CPU
 #   ./scripts/sim.sh gz_x500          # another PX4 model (here: no camera)
 #   WORLD=default ./scripts/sim.sh    # PX4's empty world instead of the house
+#   SCENARIO=rotated ./scripts/sim.sh # house from sim/scenarios/rotated.yaml (M2),
+#                                     # depth camera model by default
 #
 # Worlds come from sim/worlds/ in this repo (falling back to PX4's own worlds).
 # When the model has a camera, its image is bridged to the ROS 2 topic /camera/image_raw.
@@ -16,7 +18,12 @@ set -eo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/env.sh"   # ROS setup.bash is not `set -u` safe
 set -u
 
-MODEL="${1:-gz_x500_mono_cam}"
+SCENARIO="${SCENARIO:-}"
+if [ -n "$SCENARIO" ]; then
+    MODEL="${1:-gz_x500_depth}"
+else
+    MODEL="${1:-gz_x500_mono_cam}"
+fi
 WORLD="${WORLD:-wukong_house}"
 
 # Render engine. In the VMware Fusion VM, Gazebo's default ogre2 on the 3D-accelerated
@@ -35,7 +42,16 @@ mkdir -p "$LOG_DIR"
 # through GZ_SIM_RESOURCE_PATH, which PX4 appends to rather than replaces.
 # PX4 只从自己的 worlds 目录加载世界文件，所以把本仓库的世界文件链接过去。
 PX4_WORLDS="$PX4_DIR/Tools/simulation/gz/worlds"
-if [ -f "$WUKONG_ROOT/sim/worlds/$WORLD.sdf" ]; then
+if [ -n "$SCENARIO" ]; then
+    # Generate world, ground truth and rough map: sim/generated/<scenario>/.
+    # 生成仿真世界、真值和粗略地图。
+    SCENARIO_FILE="$WUKONG_ROOT/sim/scenarios/$SCENARIO.yaml"
+    [ -f "$SCENARIO_FILE" ] || { echo "[sim] no scenario $SCENARIO_FILE" >&2; exit 1; }
+    WORLD="wukong_$SCENARIO"
+    python3 "$WUKONG_ROOT/sim/scenario.py" "$SCENARIO_FILE" >/dev/null
+    ln -sf "$WUKONG_ROOT/sim/generated/$SCENARIO/$WORLD.sdf" "$PX4_WORLDS/$WORLD.sdf"
+    echo "[sim] scenario $SCENARIO: map for the drone and ground truth in sim/generated/$SCENARIO/"
+elif [ -f "$WUKONG_ROOT/sim/worlds/$WORLD.sdf" ]; then
     ln -sf "$WUKONG_ROOT/sim/worlds/$WORLD.sdf" "$PX4_WORLDS/$WORLD.sdf"
 elif [ ! -f "$PX4_WORLDS/$WORLD.sdf" ]; then
     echo "[sim] unknown world '$WORLD' (not in sim/worlds/ or $PX4_WORLDS)" >&2
@@ -52,6 +68,15 @@ if [ "${PX4_LOG_GB:-0}" -ge 5 ]; then
     echo "[sim]          delete old ones with: rm -rf $ROOTFS/log/*"
 fi
 
+# Refuse to start a second simulation. The cleanup below shuts down PX4 and
+# Gazebo by name, so a second copy exiting would also stop the first one.
+# 已有仿真在运行时拒绝启动：下面的清理按进程名关闭 PX4 和 Gazebo，会误关前一个仿真。
+if pidof px4 >/dev/null || pgrep -f '^gz sim' >/dev/null; then
+    echo "[sim] a simulation is already running (px4 or gz sim); stop it first:" >&2
+    echo "[sim]   Ctrl+C in its terminal, or: pgrep -af 'px4|gz sim'" >&2
+    exit 1
+fi
+
 pids=()
 cleanup() {
     trap - EXIT INT TERM
@@ -62,7 +87,15 @@ cleanup() {
         sleep 1
         pkill -KILL -x px4 2>/dev/null || true
     fi
-    pkill -f '^gz sim' 2>/dev/null || true   # Gazebo server started by PX4
+    # Gazebo server started by PX4. With a camera sensor it hangs on SIGTERM
+    # (seen with ogre1 in the VM), so give it 5 s, then kill it.
+    # 带相机时 Gazebo 收到 SIGTERM 后会卡住，等 5 秒后强制结束。
+    pkill -f '^gz sim' 2>/dev/null || true
+    for _ in 1 2 3 4 5; do
+        pgrep -f '^gz sim' >/dev/null || break
+        sleep 1
+    done
+    pkill -KILL -f '^gz sim' 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
@@ -109,15 +142,33 @@ fi
 ) &
 pids+=($!)
 
-# 3. Camera image -> ROS 2 /camera/image_raw, for models with PX4's mono_cam.
-#    相机图像桥接到 ROS 2。
-if [[ "$MODEL" == *mono_cam* ]]; then
-    GZ_MODEL="${MODEL#gz_}_0"   # PX4 names the first instance <model>_0
-    GZ_IMAGE="/world/$WORLD/model/$GZ_MODEL/link/camera_link/sensor/imager/image"
-    ros2 run ros_gz_image image_bridge "$GZ_IMAGE" \
-        --ros-args -r "$GZ_IMAGE:=/camera/image_raw" > "$LOG_DIR/camera_bridge.log" 2>&1 &
+# 3. Cameras -> ROS 2. The colour image is always /camera/image_raw; the depth
+#    camera (x500_depth) adds /depth/image (32FC1, metres) and /depth/camera_info.
+#    相机桥接：彩色图像统一发到 /camera/image_raw；深度相机另外发 /depth/...
+# Run the executables directly: killing a `ros2 run` wrapper leaves its child running.
+# 直接运行可执行文件：杀掉 ros2 run 包装进程时，子进程不会一起退出。
+GZ_MODEL="${MODEL#gz_}_0"   # PX4 names the first instance <model>_0
+GZ_SENSORS="/world/$WORLD/model/$GZ_MODEL/link/camera_link/sensor"
+GZ_COLOR=""
+case "$MODEL" in
+    *mono_cam*) GZ_COLOR="$GZ_SENSORS/imager/image" ;;
+    *x500_depth*) GZ_COLOR="$GZ_SENSORS/IMX214/image" ;;
+esac
+if [ -n "$GZ_COLOR" ]; then
+    IMAGE_BRIDGE="$(ros2 pkg prefix ros_gz_image)/lib/ros_gz_image/image_bridge"
+    remaps=(-r "$GZ_COLOR:=/camera/image_raw")
+    topics=("$GZ_COLOR")
+    if [[ "$MODEL" == *x500_depth* ]]; then
+        topics+=(/depth_camera)
+        remaps+=(-r "/depth_camera:=/depth/image")
+        "$(ros2 pkg prefix ros_gz_bridge)/lib/ros_gz_bridge/parameter_bridge" \
+            '/camera_info@sensor_msgs/msg/CameraInfo[gz.msgs.CameraInfo' \
+            --ros-args -r /camera_info:=/depth/camera_info > "$LOG_DIR/camera_info_bridge.log" 2>&1 &
+        pids+=($!)
+    fi
+    "$IMAGE_BRIDGE" "${topics[@]}" --ros-args "${remaps[@]}" > "$LOG_DIR/camera_bridge.log" 2>&1 &
     pids+=($!)
-    echo "[sim] camera bridge: $GZ_IMAGE -> /camera/image_raw (log: $LOG_DIR/camera_bridge.log)"
+    echo "[sim] camera bridge: ${topics[*]} -> ROS 2 (log: $LOG_DIR/camera_bridge.log)"
 fi
 
 # 4. PX4 SITL + Gazebo (foreground)

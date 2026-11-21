@@ -9,7 +9,8 @@ import pytest
 
 from wukong_flight.mission import (Command, Mission, MissionConfig, Phase, PlanRejected,
                                    VehicleState, waypoint_plan, waypoints_from_flat)
-from wukong_flight.skills import GoTo, Hover, Land, ReturnHome, Takeoff, TakePhoto
+from wukong_flight.skills import (Decide, GoTo, Hover, Land, ReturnHome, Scan, Takeoff,
+                                  TakePhoto)
 
 DT = 0.05
 
@@ -307,3 +308,90 @@ def test_local_frame_aborts_if_vehicle_moved_since_check():
     v.s = replace(v.s, x=8.0)
     run(m, v)
     assert m.phase == Phase.ABORTED and 'not at the start' in m.failure
+
+
+# -- Scan and Decide (M2) ------------------------------------------------------
+
+def test_scan_is_requested_when_still_and_logged():
+    m = Mission([Takeoff(5), Scan('corner 1'), Land()])
+    asked = []
+    v = FakeVehicle()
+    for _ in range(5000):
+        out = m.step(v.s)
+        if out.scan:
+            asked.append(out.scan)
+            m.scan_done(True)
+        v.apply(out)
+        if m.finished:
+            break
+    assert asked == ['corner 1'] and m.scans == [('corner 1', True)]
+    assert m.phase == Phase.DONE
+
+
+def _run_with_decision(plan, answer, limits=None, config=MissionConfig()):
+    """Fly plan; when Decide asks, answer with answer(mission) -> (skills, limits)."""
+    from wukong_flight.skills import Limits
+    m = Mission(plan, config, limits or Limits())
+    v = FakeVehicle()
+    for _ in range(20000):
+        out = m.step(v.s)
+        if out.decide and answer is not None:
+            skills, new_limits = answer(m)
+            m.decide_done(skills, new_limits)
+        v.apply(out)
+        if m.finished:
+            break
+    return m, v
+
+
+def test_decide_inserts_checked_skills_before_the_rest():
+    m, v = _run_with_decision(
+        [Takeoff(5), Decide('after survey'), ReturnHome()],
+        lambda m: ([GoTo(8, 0, 5), TakePhoto('x')], None))
+    assert m.phase == Phase.DONE
+    assert [type(s).__name__ for s in m.plan] == [
+        'Takeoff', 'Decide', 'GoTo', 'TakePhoto', 'ReturnHome']
+    assert m.decisions == [('after survey', True, [])]
+    assert any(sp.x == pytest.approx(8.0) for sp in v.setpoints)
+
+
+def test_decide_rejects_skills_that_fail_the_check_and_goes_on():
+    from wukong_flight.skills import Box, Limits
+    wall = Box(5, 7, -5, 5, 10, 'wall')
+    m, v = _run_with_decision(
+        [Takeoff(5), Decide('d'), ReturnHome()],
+        lambda m: ([GoTo(12, 0, 5)], None),          # straight through the wall
+        limits=Limits(no_fly=(wall,)))
+    assert m.phase == Phase.DONE
+    label, ok, errors = m.decisions[0]
+    assert not ok and any('no-fly box wall' in e for e in errors)
+    assert max(sp.x for sp in v.setpoints) < 1.0       # never went north
+
+
+def test_decide_can_replace_limits_with_measured_ones():
+    from wukong_flight.skills import Box, Cylinder, Limits
+    rough = Cylinder((15, 0), 9, 8, 'rough house')      # too big to get close
+    precise = Box(11, 19, -5, 5, 5.3, 'house')
+    viewpoint = [GoTo(6.5, 0, 4.5, look_at=(11, 0)), TakePhoto('gutter')]
+    # With the rough zone the viewpoint (8.5 m from its centre) is rejected...
+    m, _ = _run_with_decision([Takeoff(4.5), Decide('d'), ReturnHome()],
+                              lambda m: (viewpoint, None), limits=Limits(no_fly=(rough,)))
+    assert not m.decisions[0][1]
+    # ...with the measured box it is fine.
+    m, _ = _run_with_decision([Takeoff(4.5), Decide('d'), ReturnHome()],
+                              lambda m: (viewpoint, Limits(no_fly=(precise,))),
+                              limits=Limits(no_fly=(rough,)))
+    assert m.decisions[0][1] and m.limits.no_fly == (precise,)
+    assert m.phase == Phase.DONE
+
+
+def test_decide_timeout_goes_on_with_the_plan():
+    m, _ = _run_with_decision([Takeoff(5), Decide('slow'), ReturnHome()], None,
+                              config=MissionConfig(decide_timeout=0.5))
+    assert m.phase == Phase.DONE
+    assert m.decisions == [('slow', False, ['timed out'])]
+
+
+def test_decide_with_nothing_to_add():
+    m, _ = _run_with_decision([Takeoff(5), Decide('d'), ReturnHome()], lambda m: (None, None))
+    assert m.phase == Phase.DONE and m.decisions[0][1] is False

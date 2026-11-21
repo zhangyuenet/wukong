@@ -67,3 +67,29 @@ def test_summary_when_nothing_could_be_judged():
     v = [Verdict('south gutter', 'a.jpg', 'unclear', 'low', '(offline)')]
     assert summary_line(v) == 'No photo could be judged: south gutter.'
     assert summary_line([]) == 'No photos were taken.'
+
+
+def test_segment_summary():
+    def seg(g, i, a):
+        extra = {'gutter': g, 'segment': i, 'segments': 4}
+        return Verdict(f'{g} {i}', 'x.jpg', a, 'high', '', extra=extra)
+    v = [seg('south gutter', 2, 'yes'), seg('south gutter', 4, 'yes'),
+         seg('south gutter', 1, 'no'), seg('north gutter', 3, 'unclear')]
+    assert summary_line(v) == ('Needs cleaning: south gutter segments 2, 4. '
+                               'Could not tell: north gutter segment 3.')
+    assert summary_line([seg('north gutter', 1, 'no')]) == 'No gutter segment needs cleaning.'
+    assert summary_line([seg('north gutter', 1, 'unclear')]).startswith('No segment could')
+
+
+def test_crop_box_covers_the_segment_from_the_viewpoint():
+    from wukong_mission.gutter_task import crop_box
+    from wukong_mission.inspection import PhotoTarget
+    # South gutter segment of the basic house, photographed from 4.5 m south, facing north.
+    t = PhotoTarget('s', 'south gutter', 2, 4, (10.4, -2.75), (10.4, 0.0), 2.7,
+                    (5.9, -1.375, 3.3))
+    pose = (5.9, -1.375, 3.3, 0.0, 0.0, 0.0)
+    (left, top, right, bottom), (u0, u1) = crop_box(t, pose)
+    assert 0 <= left < right <= 1920 and 0 <= top < bottom <= 1080
+    assert 0 < u0 < u1 < right - left        # neighbours' strips on both sides
+    # Segment of 2.75 m at 4.5 m: ~0.6 rad wide, ~860 px with f ~ 1404 px.
+    assert 700 < u1 - u0 < 1000

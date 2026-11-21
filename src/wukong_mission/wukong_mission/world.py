@@ -12,7 +12,7 @@ check does not rely on it having listened.
 from dataclasses import dataclass
 from typing import List, Tuple
 
-from wukong_flight.skills import Box, Limits
+from wukong_flight.skills import Box, Cylinder, Limits
 import yaml
 
 
@@ -48,12 +48,32 @@ class House:
 
 
 @dataclass(frozen=True)
+class RoughHouse:
+    """
+    A house known only roughly: somewhere within radius of approx_center.
+
+    Its exact shape comes from perception in flight (M2). Until then the whole
+    circle, up to max_height, is a no-fly zone.
+    只知道大概位置的房屋：精确形状在飞行中由感知得到，之前整个圆柱都是禁飞区。
+    """
+
+    name: str
+    approx_center: Tuple[float, float]
+    radius: float
+    max_height: float
+
+    def zone(self) -> Cylinder:
+        return Cylinder(self.approx_center, self.radius, self.max_height, self.name)
+
+
+@dataclass(frozen=True)
 class WorldMap:
     name: str
     houses: Tuple[House, ...]
     limits: Limits
     camera_hfov_deg: float
     camera_vfov_deg: float
+    rough_houses: Tuple[RoughHouse, ...] = ()
 
     def describe(self) -> str:
         """Plain-text map for the planner prompt."""
@@ -70,6 +90,10 @@ class WorldMap:
             for g in h.gutters:
                 lines.append(f'  - {g.name}: from {g.start} to {g.end} at {g.height:g} m, '
                              f'midpoint {g.midpoint}.')
+        for r in self.rough_houses:
+            lines.append(f'- {r.name}: exact shape unknown; it lies within {r.radius:g} m of '
+                         f'{r.approx_center} and is at most {r.max_height:g} m tall. Its shape '
+                         f'and gutters are measured in flight by the survey_house skill.')
         lim = self.limits
         lines.append(
             f'Flight limits: altitude {lim.min_altitude:g}..{lim.max_altitude:g} m above the '
@@ -94,7 +118,12 @@ def load_world(path: str) -> WorldMap:
     with open(path, encoding='utf-8') as f:
         data = yaml.safe_load(f)
     houses: List[House] = []
+    rough: List[RoughHouse] = []
     for h in data.get('houses', []):
+        if 'approx_center' in h:
+            rough.append(RoughHouse(h['name'], _pair(h['approx_center']), float(h['radius']),
+                                    float(h['max_height'])))
+            continue
         gutters = tuple(Gutter(g['name'], _pair(g['from']), _pair(g['to']), float(g['height']))
                         for g in h.get('gutters', []))
         houses.append(House(
@@ -109,8 +138,9 @@ def load_world(path: str) -> WorldMap:
         max_altitude=float(lim.get('max_altitude', Limits.max_altitude)),
         max_distance=float(lim.get('max_distance', Limits.max_distance)),
         margin=float(lim.get('margin', Limits.margin)),
-        no_fly=tuple(h.box() for h in houses))
+        no_fly=tuple(h.box() for h in houses) + tuple(r.zone() for r in rough))
     cam = data.get('camera', {})
     return WorldMap(name=str(data.get('name', 'map')), houses=tuple(houses), limits=limits,
                     camera_hfov_deg=float(cam.get('horizontal_fov_deg', 90)),
-                    camera_vfov_deg=float(cam.get('vertical_fov_deg', 60)))
+                    camera_vfov_deg=float(cam.get('vertical_fov_deg', 60)),
+                    rough_houses=tuple(rough))

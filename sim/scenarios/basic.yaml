@@ -1,0 +1,14 @@
+# The M1 house, with the south gutter split into 4 segments.
+# M1 的房屋，南侧水槽分 4 段。
+seed: 1
+house:
+  center: [15.0, 0.0]        # north, east of the takeoff point, metres
+  ridge_bearing_deg: 90      # ridge runs east-west
+  length: 10.0
+  depth: 8.0
+gutters:
+  # a: the eave on the left of the ridge direction, b: on the right.
+  # Each list item is one segment: clean, leaves or blocked.
+  # a 是沿屋脊方向左侧的屋檐，b 是右侧。每一项是一段：clean、leaves 或 blocked。
+  a: [clean, clean, clean, clean]
+  b: [clean, leaves, clean, blocked]

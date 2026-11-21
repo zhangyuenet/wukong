@@ -14,13 +14,13 @@ relative to the takeoff point as (north, east, altitude-up) and converted here.
 坐标系：PX4 本地 NED（z 向下）。计划用相对起飞点的（北, 东, 高度）表示，在这里换算。
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import enum
 import math
 from typing import List, Optional, Sequence, Tuple
 
-from .skills import (check_plan, describe, GoTo, Hover, Land, Limits, ReturnHome, Skill,
-                     Takeoff, TakePhoto)
+from .skills import (check_plan, Decide, describe, GoTo, Hover, Land, Limits, ReturnHome,
+                     Scan, Skill, Takeoff, TakePhoto)
 
 
 class Phase(enum.Enum):
@@ -62,6 +62,8 @@ class VehicleState:
     # previous mission). Only used to explain a failed arm, never as a gate.
     # 它也检查当前模式：上一次任务结束后 PX4 停在 offboard 模式、没有设定点时为 false。
     preflight_ok: bool = False
+    roll: float = 0.0            # radians, body FRD
+    pitch: float = 0.0           # radians, nose up positive
 
 
 @dataclass(frozen=True)
@@ -78,6 +80,8 @@ class Output:
     commands: List[Command] = field(default_factory=list)
     events: List[str] = field(default_factory=list)   # human-readable log lines
     photo: Optional[str] = None           # take a photo now, with this label
+    scan: Optional[str] = None            # capture a depth frame now, with this label
+    decide: Optional[str] = None          # ask the mission layer for the next skills
 
 
 @dataclass(frozen=True)
@@ -86,7 +90,14 @@ class MissionConfig:
     yaw_tolerance: float = 0.1             # rad (~6 deg)
     max_speed: float = 3.0                 # m/s, how fast the setpoint moves
     settle_speed: float = 0.3              # m/s, must be this still to take a photo
-    photo_timeout: float = 5.0             # s, give up on one photo after this
+    photo_timeout: float = 5.0             # s, give up on one photo or scan after this
+    decide_timeout: float = 30.0           # s, then go on with the plan as it is
+    # Depth scans need the vehicle truly still: braking tilts it by several
+    # degrees, which is metres of error at 15 m. 深度扫描要求完全静止：刹车时
+    # 机身倾斜几度，在 15 米处就是几米的误差。
+    scan_settle_speed: float = 0.1         # m/s
+    scan_yaw_tolerance: float = 0.02       # rad (~1 deg)
+    scan_settle_time: float = 1.0          # s, continuously still before scanning
     prestream_time: float = 1.0            # s of setpoints before asking for offboard
     command_retry: float = 1.0             # s between repeated mode/arm/land commands
     ready_timeout: float = 60.0            # s to wait for PX4 to be ready
@@ -158,11 +169,15 @@ class Mission:
         if not check.ok:
             raise PlanRejected(check.errors)
         self.plan = list(plan)
+        self.limits = limits
         self.config = config
         self.phase = Phase.WAIT_READY
         self.index = 0                      # current skill
         self.failure: Optional[str] = None  # why the mission did not complete
         self.photos: List[Tuple[str, bool]] = []   # (label, taken)
+        self.scans: List[Tuple[str, bool]] = []
+        # (label, accepted, errors): what happened at each Decide skill
+        self.decisions: List[Tuple[str, bool, List[str]]] = []
         self._phase_start: Optional[float] = None
         self._skill_start = 0.0
         self._leg_limit = math.inf
@@ -171,9 +186,10 @@ class Mission:
         self._home: Optional[Setpoint] = None
         self._target: Optional[Setpoint] = None     # where the current skill goes
         self._carrot: Optional[Setpoint] = None     # setpoint sent, moving at max_speed
-        self._photo_asked_t: Optional[float] = None
-        self._photo_done = False
-        self._photo_ok = False
+        self._asked_t: Optional[float] = None        # photo/scan/decide request sent
+        self._still_since: Optional[float] = None
+        self._answered = False
+        self._answer: object = None
         self._land_requested = False
 
     # -- public -------------------------------------------------------------
@@ -188,8 +204,34 @@ class Mission:
 
     def photo_done(self, ok: bool = True) -> None:
         """Tell the mission the photo it asked for has been taken (or failed)."""
-        self._photo_done = True
-        self._photo_ok = ok
+        self._answer = ok
+        self._answered = True   # set last: may be called from another thread
+
+    def scan_done(self, ok: bool = True) -> None:
+        """Tell the mission the depth scan it asked for has been captured (or failed)."""
+        self._answer = ok
+        self._answered = True   # set last: may be called from another thread
+
+    def decide_done(self, skills: Optional[Sequence[Skill]],
+                    limits: Optional[Limits] = None, why: str = '') -> None:
+        """
+        Answer a Decide skill: the skills to insert, or None to insert nothing.
+
+        limits replaces the mission's limits from now on (e.g. a no-fly box
+        measured by perception instead of a rough one). Both are checked
+        together, on the next step, before anything changes.
+        可以同时替换限制（例如用感知测得的禁飞区代替粗略的），在下一步一起检查。
+        """
+        self._answer = (list(skills) if skills else None, limits, why)
+        self._answered = True   # set last: called from a worker thread
+
+    def plan_position(self, s: VehicleState) -> Tuple[float, float, float]:
+        """PX4 local NED -> plan coordinates (north, east, altitude)."""
+        assert self._home is not None
+        alt = self._home.z - s.z
+        if self.frame == 'local':
+            return s.x, s.y, alt
+        return s.x - self._home.x, s.y - self._home.y, alt
 
     def to_ned(self, north: float, east: float, altitude: float) -> Tuple[float, float, float]:
         """Plan coordinates -> PX4 local NED setpoint."""
@@ -237,8 +279,10 @@ class Mission:
         assert self._target is not None
         skill = self.plan[self.index]
         self._skill_start = s.t
-        self._photo_asked_t = None
-        self._photo_done = False
+        self._asked_t = None
+        self._still_since = None
+        self._answered = False
+        self._answer = None
         out.events.append(f'skill {self.index + 1}/{len(self.plan)}: {describe(skill)}')
         cur = self._target
         if isinstance(skill, Takeoff):
@@ -262,6 +306,8 @@ class Mission:
         self._leg_limit = self.config.leg_timeout + dist / self.config.max_speed
         if isinstance(skill, Hover):
             self._leg_limit += skill.seconds
+        elif isinstance(skill, Decide):
+            self._leg_limit += self.config.decide_timeout
 
     def _next_skill(self, s: VehicleState, out: Output) -> None:
         self.index += 1
@@ -379,6 +425,45 @@ class Mission:
         self._last_t = s.t
         return out
 
+    def _settled(self, s: VehicleState, strict: bool) -> bool:
+        """Arrived and still; for scans, very still for scan_settle_time."""
+        cfg = self.config
+        if not strict:
+            return s.speed < cfg.settle_speed and self._arrived(s)
+        assert self._target is not None
+        still = (self._arrived(s) and s.speed < cfg.scan_settle_speed
+                 and abs(_wrap(s.heading - self._target.yaw)) < cfg.scan_yaw_tolerance)
+        if not still:
+            self._still_since = None
+            return False
+        if self._still_since is None:
+            self._still_since = s.t
+        return s.t - self._still_since >= cfg.scan_settle_time
+
+    def _apply_decision(self, label: str, s: VehicleState, out: Output) -> None:
+        """Insert the skills from decide_done() after the current one, if they pass the check."""
+        skills, limits, why = self._answer
+        if not skills:
+            self.decisions.append((label, False, [why or 'nothing to add']))
+            out.events.append(f'decide "{label}": nothing added' + (f' ({why})' if why else ''))
+            return
+        assert self._target is not None
+        here = self.plan_position(replace(s, x=self._target.x, y=self._target.y,
+                                          z=self._target.z))
+        rest = list(skills) + self.plan[self.index + 1:]
+        new_limits = limits if limits is not None else self.limits
+        check = check_plan(rest, new_limits, self.start, initial=here)
+        if not check.ok:
+            self.decisions.append((label, False, check.errors))
+            out.events.append(f'decide "{label}": rejected by the check, going on with the '
+                              f'plan: {"; ".join(check.errors[:3])}')
+            return
+        self.plan = self.plan[:self.index + 1] + rest
+        self.limits = new_limits
+        self.decisions.append((label, True, []))
+        out.events.append(f'decide "{label}": {len(skills)} skill(s) added, '
+                          f'plan now {len(self.plan)} skills')
+
     def _run_skill(self, s: VehicleState, out: Output) -> None:
         skill = self.plan[self.index]
         cfg = self.config
@@ -391,19 +476,33 @@ class Mission:
         elif isinstance(skill, Hover):
             if s.t - self._skill_start >= skill.seconds:
                 self._next_skill(s, out)
-        elif isinstance(skill, TakePhoto):
-            if self._photo_asked_t is None:
-                if s.speed < cfg.settle_speed and self._arrived(s):
-                    self._photo_asked_t = s.t
-                    out.photo = skill.label
-            elif self._photo_done:
-                self.photos.append((skill.label, self._photo_ok))
-                if not self._photo_ok:
-                    out.events.append(f'photo "{skill.label}" failed, continuing')
+        elif isinstance(skill, (TakePhoto, Scan)):
+            kind, log = (('photo', self.photos) if isinstance(skill, TakePhoto)
+                         else ('scan', self.scans))
+            if self._asked_t is None:
+                if self._settled(s, kind == 'scan'):
+                    self._asked_t = s.t
+                    setattr(out, kind, skill.label)
+            elif self._answered:
+                log.append((skill.label, bool(self._answer)))
+                if not self._answer:
+                    out.events.append(f'{kind} "{skill.label}" failed, continuing')
                 self._next_skill(s, out)
-            elif s.t - self._photo_asked_t > cfg.photo_timeout:
-                self.photos.append((skill.label, False))
-                out.events.append(f'photo "{skill.label}" timed out, continuing')
+            elif s.t - self._asked_t > cfg.photo_timeout:
+                log.append((skill.label, False))
+                out.events.append(f'{kind} "{skill.label}" timed out, continuing')
+                self._next_skill(s, out)
+        elif isinstance(skill, Decide):
+            if self._asked_t is None:
+                if s.speed < cfg.settle_speed and self._arrived(s):
+                    self._asked_t = s.t
+                    out.decide = skill.label
+            elif self._answered:
+                self._apply_decision(skill.label, s, out)
+                self._next_skill(s, out)
+            elif s.t - self._asked_t > cfg.decide_timeout:
+                self.decisions.append((skill.label, False, ['timed out']))
+                out.events.append(f'decide "{skill.label}" timed out, going on with the plan')
                 self._next_skill(s, out)
         elif isinstance(skill, Land):   # handled in _start_skill, kept for safety
             self._enter(Phase.LAND, s, out, 'plan complete')
