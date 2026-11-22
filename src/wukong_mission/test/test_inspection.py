@@ -91,7 +91,7 @@ def test_matching_gutters_by_direction():
     est = estimate((16.0, 6.0), 60, 14.0, 8.3)       # eaves face 330 (NW) and 150 (SE)
     names = sorted(e.name for e in est.eaves)
     assert names == ['northwest gutter', 'southeast gutter']
-    assert matching_gutters(est, []) is None
-    assert matching_gutters(est, ['north']) == ['northwest gutter']   # 30 deg off
-    assert matching_gutters(est, ['south']) == ['southeast gutter']
-    assert sorted(matching_gutters(est, ['east', 'west'])) == names
+    assert matching_gutters(est.eaves, []) is None
+    assert matching_gutters(est.eaves, ['north']) == ['northwest gutter']   # 30 deg off
+    assert matching_gutters(est.eaves, ['south']) == ['southeast gutter']
+    assert sorted(matching_gutters(est.eaves, ['east', 'west'])) == names

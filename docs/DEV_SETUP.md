@@ -224,7 +224,47 @@ python3 sim/evaluate.py log/missions/<时间>/report.json sim/generated/basic/tr
 使用同一个高度坐标系，所以不受影响。拟合结果里的 `ground_level` 是从点云中测得
 的地面高度，和实际比较时要减去它。
 
-## 9. 常见问题
+## 9. 复杂房屋（M3）
+
+M3 的场景不告诉无人机房屋在哪里、是什么类型，地图里只有安全限制和搜索半径；
+房屋类型（独立屋还是联排、几层、目标户的分界）由 Claude 看照片判断。`run_task`
+会根据正在运行的仿真世界自动选择地图，不需要指定场景，命令和 M2 一样：
+
+```bash
+SCENARIO=two_storey ./scripts/sim.sh      # 两层独立屋，带车库和门廊
+SCENARIO=row_middle ./scripts/sim.sh      # 五户联排，目标是中间户
+SCENARIO=row_end ./scripts/sim.sh         # 四户联排，目标是端户（三面水槽）
+
+ros2 run wukong_mission run_task "帮我检查一下旁边这栋房子所有的水槽，告诉我哪几段需要清理"
+./scripts/eval_m2.sh two_storey row_end row_middle    # 批量打分
+```
+
+`--offline` 不联网时没有 Claude 判断房屋类型，改用仿真生成的真值
+（`sim/generated/<场景>/truth.json`）代替，作用和离线时的假照片判断一样，只用于仿真。
+
+一次任务的过程：
+
+1. 在起飞点上方 6 米环视扫描，找出最近的建筑。
+2. 对准房屋正面上离起飞点最近的位置（离两端至少 3 米），停稳后拍一张照片，画上
+   每米一格的刻度尺和一条中线，由 Claude 判断是独立屋还是联排；联排还要读出中线所在
+   那一户的分界。端户靠外的一端直接取整排的尽头。
+   （照片比拍照请求晚几百毫秒到达，飞机还在转动时刻度尺会画偏，所以这张照片要像深度
+   扫描一样等朝向误差在 1 度以内、静止 1 秒再拍。）
+3. 逐站扫描：每扫描一次就重新估计建筑轮廓，只决定下一站。先在高处绕一圈，
+   再降低绕一圈。联排只扫描目标户附近，需要时从屋顶上方越过。
+4. 用高度图识别所有楼层的屋檐，规划逐段拍照的航线（绕开一切看到的东西），
+   拍照、判断、写报告。
+
+不用 Gazebo 也能检查逻辑：
+
+```bash
+python3 sim/perception_check.py two_storey     # 只检查屋檐识别
+python3 sim/mission_check.py two_storey row_end --drift 0.4   # 整个任务，含位置漂移
+```
+
+`mission_check.py` 用光线投射代替深度相机，每个场景十几秒。
+
+## 10. 常见问题
 
 **Gazebo 三维视图一片灰色，看不到地面和无人机**
 
@@ -269,6 +309,17 @@ setuptools，与 ROS 2 用 apt 安装的版本冲突。可以用
 上一次仿真的 Gazebo 服务器还在运行。`pgrep -af '^gz sim'` 查看，用
 `pkill -f '^gz sim'` 结束后再启动。
 
+**`run_task` 报 “no vehicle position from PX4”，但 PX4 话题都在**
+
+PX4 的位置估计没有接受 GPS：航向没有对准，因为磁场被判为“受到干扰”。用
+`./scripts/px4cmd.sh listener estimator_status_flags` 检查，`cs_yaw_align` 为
+False、`cs_mag_field_disturbed` 为 True 就是这个问题。
+
+原因是 PX4 会在飞行中学习磁力计偏置，并在上锁时保存。在同一个 PX4 上仿真飞行
+几十次后，偏置漂到了 0.25 高斯，约为地磁场的一半，修正后的磁场强度明显偏小。
+`sim.sh` 现在每次启动时把 `CAL_MAG0_*OFF` 清零，并关闭 `SENS_MAG_AUTOCAL`。
+这只用于仿真，真机必须使用真实的磁力计校准。
+
 **解锁被拒，PX4 报 `Preflight Fail: Battery unhealthy`**
 
 这是 PX4 SITL 的问题，出现过两次，都在带深度相机的仿真运行约 10 分钟、飞过几次
@@ -282,6 +333,19 @@ RATE 都是 0，就是这个问题。重启仿真即可。
 还没有找到触发条件：空转超过 10 分钟、连续飞 4 次都没有复现。要查清原因，需要
 用 gdb 附加到 PX4 进程，而这台虚拟机限制了 ptrace，必须用 sudo。
 `scripts/eval_m2.sh` 每个场景都重新启动仿真，不受影响。
+
+**任务中途报 `-> land (lost vehicle state)`，但 PX4 一切正常**
+
+`run_task` 超过 0.5 秒收不到 PX4 的状态或位置消息，就认为失去了联系。M3 中出现过
+一次：PX4 的日志显示飞机一直在 offboard 模式下正常悬停，是 `run_task` 这一侧暂时
+没有收到消息，原因还没查清。现在的处理：
+
+- 中断不到 1 秒：保持最后的设定点，恢复后继续飞。
+- 超过 1 秒：请 PX4 原地降落，并持续重发降落指令，直到重新收到消息、确认已经落地
+  上锁；60 秒仍无消息就结束任务，由 PX4 的失效保护处置。报告里写明飞行没有完成，
+  没拍到的段标为“未检查”。
+- 日志里的 `no fresh vehicle state: status ... position ... old` 记录了哪种消息停了
+  多久，再出现时用它查原因。
 
 **磁盘被 PX4 日志写满**
 

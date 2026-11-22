@@ -236,7 +236,8 @@ class GutterTaskSpec(BaseModel):
     feasible: bool = Field(description='False if this is not a gutter inspection of a '
                                        'house on the map')
     reason_if_not: Optional[str] = None
-    house: str = Field(description='Name of the house on the map')
+    house: str = Field(description='Name of the house on the map, or "nearest" when the '
+                                   'map has no house positions')
     sides: List[Side] = Field(
         description='Only inspect gutters facing these directions; empty list = all gutters')
 
@@ -274,6 +275,8 @@ class GutterPlanner:
         if not spec.feasible:
             raise PlanningError(f'the model says this cannot be done: '
                                 f'{spec.reason_if_not or "no reason given"}')
+        if self.world.find_house:       # M3: the house is whatever is nearest, found in flight
+            return GutterRequest(spec.understood, 'nearest', list(spec.sides))
         names = [h.name for h in self.world.rough_houses]
         if spec.house not in names:
             raise PlanningError(f'the model picked "{spec.house}", which is not on the map '
@@ -289,6 +292,9 @@ class OfflineGutterPlanner:
 
     def request(self, instruction: str):
         from .gutter_task import GutterRequest
+        if self.world.find_house:
+            return GutterRequest(f'(offline) inspect all gutters of the nearest building: '
+                                 f'{instruction}', 'nearest', [])
         if not self.world.rough_houses:
             raise PlanningError('no house on the map')
         h = self.world.rough_houses[0]

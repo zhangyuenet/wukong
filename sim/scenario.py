@@ -238,9 +238,14 @@ def main(argv=None) -> int:
     if not re.fullmatch(r'[A-Za-z0-9_]+', name):
         print(f'scenario file name must be letters, digits and _: {name}', file=sys.stderr)
         return 2
-    model, truth, rough = build(cfg, name)
     out = os.path.join(args.out, name)
     os.makedirs(out, exist_ok=True)
+    if 'buildings' in cfg:      # M3: blocks, several roof types, townhouses
+        sys.path.insert(0, HERE)
+        import buildings
+        model, truth, rough = buildings.build(cfg, name, out)
+    else:                       # M2: one gabled house
+        model, truth, rough = build(cfg, name)
     world_name = f'wukong_{name}'
     with open(os.path.join(out, f'{world_name}.sdf'), 'w', encoding='utf-8') as f:
         f.write(world_sdf(world_name, model))

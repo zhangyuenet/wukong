@@ -35,11 +35,18 @@ COMPASS_BEARING = {'north': 0, 'northeast': 45, 'east': 90, 'southeast': 135, 's
 
 SEGMENT_QUESTION = (
     'This picture is cropped to ONE segment of a roof gutter: the white channel running '
-    'along the bottom edge of the roof, seen from the side and slightly above. The darkened '
-    'strips at the left and right edges belong to the neighbouring segments: ignore '
-    'anything that is only in those strips. Is there anything in the bright part of this '
-    'gutter (leaves, debris, a pile of material) that means it needs cleaning? Only consider '
-    'the gutter, not the roof or the wall.')
+    'across the picture along the bottom edge of the roof right in front of the camera, '
+    'seen from the side and slightly above. Judge only that gutter, the one closest to the '
+    'camera. Ignore any other gutter further away, for example one going away from the '
+    'camera around a corner of the roof: it is inspected separately. The darkened strips at '
+    'the left and right edges belong to the neighbouring segments: ignore anything that is '
+    'only in those strips. Is there anything in this gutter segment (leaves, debris, a pile '
+    'of material) that means it needs cleaning? Seen from this angle, debris in a gutter '
+    'usually sticks up above its outer lip and shows against the roof behind it: anything '
+    "sitting along the gutter's edge counts, even if most of it is seen against the roof. "
+    'If debris reaches into the bright part even a little, the answer is yes. Answer unclear '
+    'only when the gutter itself cannot be seen well enough. Ignore the roof surface and the '
+    'wall themselves.')
 
 
 @dataclass
@@ -51,12 +58,12 @@ class GutterRequest:
     sides: List[str] = field(default_factory=list)   # compass words; empty = all gutters
 
 
-def matching_gutters(est: HouseEstimate, sides: Sequence[str]) -> Optional[List[str]]:
+def matching_gutters(eaves: Sequence, sides: Sequence[str]) -> Optional[List[str]]:
     """Names of the eaves facing the requested directions; None means all."""
     if not sides:
         return None
     out = []
-    for e in est.eaves:
+    for e in eaves:
         for side in sides:
             b = COMPASS_BEARING.get(side.lower().strip())
             if b is None:
@@ -77,15 +84,21 @@ def crop_box(target: PhotoTarget, pose: Sequence[float], size=(1920, 1080),
     Pixel box (left, top, right, bottom) around the segment in a photo.
 
     From the vehicle pose when the photo was taken, both segment ends at gutter
-    height (left/right), and points 0.7 m above and 0.5 m below its middle
+    height (left/right), and points 0.4 m above and 0.9 m below its middle
     (top/bottom). Also returns the segment's own columns (u0, u1) inside the
     box; the margin outside them shows the neighbours. None if the segment is
     not in front of the camera.
     用拍照时的位姿把水槽段的两端投影到图像上，求出裁剪框。
     """
     mid = ((target.start[0] + target.end[0]) / 2, (target.start[1] + target.end[1]) / 2)
+    # Top only 0.4 m above the gutter: a gutter further away (round a corner)
+    # appears higher in the picture and is mostly cut off. 上边缘只到水槽上方 0.4 米：
+    # 远处的水槽（转角后面的）在画面中更靠上，大部分会被裁掉。
+    # Bottom 0.9 m below: a gutter measured a little too far away (a skewed
+    # eave line) appears lower in the picture than predicted. 下边缘放宽到 0.9 米：
+    # 位置估计偏远的水槽在画面中比预测的更低。
     pts = np.array([[*target.start, target.height], [*target.end, target.height],
-                    [*mid, target.height + 0.7], [*mid, target.height - 0.5]])
+                    [*mid, target.height + 0.4], [*mid, target.height - 0.9]])
     uvd = project(pts, RGB_X500_DEPTH, pose)
     if np.any(uvd[:, 2] <= 0.5) or not np.all(np.isfinite(uvd)):
         return None
@@ -154,7 +167,7 @@ class GutterTask:
                  + ', '.join(f'{e.name} ({e.length:.1f} m at {e.height - g:.1f} m)'
                              for e in est.eaves)
                  + (f'; notes: {"; ".join(est.notes)}' if est.notes else ''))
-        names = matching_gutters(est, self.request.sides)
+        names = matching_gutters(est.eaves, self.request.sides)
         if names is not None and not names:
             self.decide_note = (f'no gutter faces {", ".join(self.request.sides)}; found '
                                 + ', '.join(e.name for e in est.eaves))
@@ -207,7 +220,8 @@ class GutterTask:
         if target is not None:
             v.extra = {'gutter': target.gutter, 'segment': target.segment,
                        'segments': target.segments, 'from': list(target.start),
-                       'to': list(target.end), 'full_photo': path}
+                       'to': list(target.end), 'height': target.height,
+                       'full_photo': path}
         return v
 
     # -- after landing --------------------------------------------------------------

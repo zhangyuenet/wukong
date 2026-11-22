@@ -81,4 +81,7 @@ for sc in "${scenarios[@]}"; do
     echo "  $sc: ${result[$sc]}"
     [ "${result[$sc]}" = PASS ] || fail=1
 done
+# Keep the newest runs only; mark a run worth keeping with a KEEP file.
+# 只保留最近几次；值得长期保留的运行请在目录里放 KEEP 文件。
+"$ROOT/scripts/clean_logs.sh" || true
 exit $fail

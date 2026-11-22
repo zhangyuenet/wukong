@@ -1,0 +1,20 @@
+# Five townhouses in a row; the drone takes off in front of the middle one (unit 3).
+# Only unit 3's front and back gutters may be inspected. Neighbours have debris too,
+# so inspecting the wrong unit shows up in the score.
+# 五户联排，从第 3 户门前起飞，只能检查第 3 户的前后水槽；邻居的水槽也有杂物。
+seed: 21
+target: "row:3"
+buildings:
+  - name: row
+    type: row
+    center: [16.0, 0.0]
+    bearing: 90
+    units: 5
+    unit_width: 6.5
+    depth: 10.0
+    wall_height: 5.6
+    roof: gable
+    unit_gutters:
+      2: {right: [blocked, clean]}
+      3: {right: [clean, leaves], left: [clean, clean]}
+      4: {left: [leaves, clean]}

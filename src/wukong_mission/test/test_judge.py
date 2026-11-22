@@ -93,3 +93,14 @@ def test_crop_box_covers_the_segment_from_the_viewpoint():
     assert 0 < u0 < u1 < right - left        # neighbours' strips on both sides
     # Segment of 2.75 m at 4.5 m: ~0.6 rad wide, ~860 px with f ~ 1404 px.
     assert 700 < u1 - u0 < 1000
+
+
+def test_report_lists_segments_without_photo(tmp_path):
+    extra = {'gutter': 'north gutter', 'segment': 2, 'segments': 3}
+    v = [Verdict('north gutter segment 2 of 3', '', 'skipped', 'low',
+                 'not inspected: the flight ended before this photo', extra=extra)]
+    md = write_report(str(tmp_path), 'check gutters', Plan('check', []), False,
+                      'skill 9 timed out', v)
+    text = open(md, encoding='utf-8').read()
+    assert 'not inspected' in text and '![' not in text
+    assert 'did not complete (skill 9 timed out)' in text

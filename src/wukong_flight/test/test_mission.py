@@ -150,6 +150,33 @@ def test_photo_waits_for_settle_and_continues_after_capture():
     assert taken[0][1] < 0.3                      # vehicle was still
 
 
+def _first_photo_tick(steady, heading_error, until=None):
+    """Tick at which the photo is asked for, flying with a heading error (cleared at until)."""
+    m = Mission([Takeoff(5), GoTo(5, 0, 5, look_at=(15, 0)), TakePhoto('x', steady=steady),
+                 ReturnHome()])
+    v = FakeVehicle()
+    for i in range(3000):
+        out = m.step(v.s)
+        if out.photo:
+            return i, out
+        v.apply(out)
+        err = heading_error if until is None or i < until else 0.0
+        v.s = replace(v.s, heading=v.s.heading + err)
+    return None, None
+
+
+def test_steady_photo_waits_like_a_scan():
+    # 3 degrees off: good enough for an ordinary photo, not for a steady one.
+    # 偏 3 度：普通照片可以拍，需要稳定的照片要等。
+    normal, _ = _first_photo_tick(False, math.radians(3))
+    assert normal is not None
+    assert _first_photo_tick(True, math.radians(3))[0] is None
+    # Once on heading it still waits scan_settle_time before asking. 对准后仍需静止一段时间。
+    steady, _ = _first_photo_tick(True, math.radians(3), until=normal + 10)
+    cfg = MissionConfig()
+    assert steady is not None and (steady - normal - 10) * DT >= cfg.scan_settle_time - DT
+
+
 def test_photo_timeout_does_not_stop_the_mission():
     m = Mission([Takeoff(5), TakePhoto('nothing answers'), Land()],
                 MissionConfig(photo_timeout=0.5))
@@ -395,3 +422,100 @@ def test_decide_timeout_goes_on_with_the_plan():
 def test_decide_with_nothing_to_add():
     m, _ = _run_with_decision([Takeoff(5), Decide('d'), ReturnHome()], lambda m: (None, None))
     assert m.phase == Phase.DONE and m.decisions[0][1] is False
+
+
+def test_decide_with_own_way_home_replaces_the_rest():
+    from wukong_flight.skills import Box, Limits
+    wall = Box(5, 7, -5, 5, 10, 'wall')            # between home and the far side
+    lim = Limits(no_fly=(wall,))
+    # Go round the wall to the far side and back the same way: the decision
+    # brings its own route home, so the straight ReturnHome is replaced.
+    around = [GoTo(0, 8, 5), GoTo(12, 8, 5), GoTo(12, 0, 5), TakePhoto('far side'),
+              GoTo(12, 8, 5), GoTo(0, 8, 5), GoTo(0, 0, 5), ReturnHome()]
+    m, v = _run_with_decision([Takeoff(5), Decide('d'), ReturnHome()],
+                              lambda m: (around, None), limits=lim)
+    assert m.decisions[0][1] and m.phase == Phase.DONE
+    assert any(sp.x == pytest.approx(12.0) for sp in v.setpoints)
+    # The same skills without the way back would end on the far side, and the
+    # straight ReturnHome from there crosses the wall: rejected.
+    m, _ = _run_with_decision([Takeoff(5), Decide('d'), ReturnHome()],
+                              lambda m: (around[:4], None), limits=lim)
+    assert not m.decisions[0][1]
+
+
+def test_losing_contact_in_flight_is_not_taken_for_a_disarm():
+    # Px4Link reports connected=False with armed/offboard False when messages stop.
+    m = Mission([Takeoff(5), GoTo(45, 0, 5), Land()])
+    v = FakeVehicle()
+
+    def silence(i, mission, vehicle):
+        if mission.index == 1 and mission.phase == Phase.RUNNING:
+            vehicle.s = VehicleState(t=vehicle.s.t, connected=False, position_valid=False)
+    phases = run(m, v, max_ticks=200, on_tick=silence)
+    # Handled as lost contact (the landing path), not as a disarm (giving up),
+    # and the defaults of a silent link (disarmed, landed) are not taken for a landing.
+    assert Phase.ABORTED not in phases and Phase.DONE not in phases
+    assert m.phase == Phase.LAND and 'lost vehicle state' in m.failure
+    assert v.commands.count(Command.LAND) >= 5      # keeps asking PX4 to land
+
+
+def test_landing_completes_when_contact_returns():
+    m = Mission([Takeoff(5), GoTo(45, 0, 5), Land()])
+    v = FakeVehicle()
+    silent = []
+
+    def silence(i, mission, vehicle):
+        if mission.index == 1 and mission.phase == Phase.RUNNING:
+            silent.append(vehicle.s)
+            vehicle.s = VehicleState(t=vehicle.s.t, connected=False, position_valid=False)
+        elif mission.phase == Phase.LAND and silent and len(silent) < 50:
+            silent.append(None)
+        elif silent and not vehicle.s.connected:          # messages arrive again
+            real = next(x for x in silent if x is not None)
+            vehicle.s = replace(real, t=vehicle.s.t, landing=True, offboard=False)
+    run(m, v, on_tick=silence)
+    assert m.phase == Phase.DONE and m.failure      # landed, but the plan was cut short
+
+
+def test_silent_landing_gives_up_after_lost_timeout():
+    m = Mission([Takeoff(5), GoTo(45, 0, 5), Land()], MissionConfig(lost_timeout=3.0))
+    v = FakeVehicle()
+
+    def silence(i, mission, vehicle):
+        if mission.index == 1:
+            vehicle.s = VehicleState(t=vehicle.s.t, connected=False, position_valid=False)
+    run(m, v, max_ticks=400, on_tick=silence)
+    assert m.phase == Phase.ABORTED and 'PX4 failsafe' in m.failure
+
+
+def test_short_gap_in_messages_holds_and_flies_on():
+    m = Mission([Takeoff(5), GoTo(45, 0, 5), Land()])
+    v = FakeVehicle()
+    gap = []
+
+    def hiccup(i, mission, vehicle):
+        if mission.index == 1 and vehicle.s.x > 10 and len(gap) < 5:   # 0.5 s of silence
+            gap.append(vehicle.s)
+            vehicle.s = replace(vehicle.s, connected=False, position_valid=False)
+        elif len(gap) == 5 and not vehicle.s.connected:
+            vehicle.s = replace(vehicle.s, connected=True, position_valid=True)
+    phases = run(m, v, on_tick=hiccup)
+    assert len(gap) == 5
+    assert m.phase == Phase.DONE and m.failure is None and Phase.BRAKE not in phases
+    assert v.s.x == pytest.approx(45, abs=1.0)
+
+
+def test_hold_position_is_the_target_not_the_hovering_vehicle():
+    # In-flight decisions are checked from the target, so they are planned from it.
+    m = Mission([Takeoff(5), GoTo(10, 0, 5), Hover(1), Land()])
+    v = FakeVehicle()
+    seen = []
+
+    def drift(i, mission, vehicle):
+        if mission.index == 2 and not seen:
+            vehicle.s = replace(vehicle.s, x=vehicle.s.x + 0.4)    # within tolerance
+            seen.append((mission.plan_position(vehicle.s), mission.hold_position(vehicle.s)))
+    run(m, v, on_tick=drift)
+    actual, hold = seen[0]
+    assert hold == pytest.approx((10.0, 0.0, 5.0))
+    assert actual[0] == pytest.approx(10.4, abs=0.05)

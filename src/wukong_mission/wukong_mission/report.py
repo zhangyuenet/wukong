@@ -13,7 +13,8 @@ from .judge import Verdict
 from .planner import Plan
 
 _ANSWER = {'yes': 'needs attention', 'no': 'OK', 'unclear': 'unclear',
-           'error': 'not judged', 'pending': 'not judged (timed out)'}
+           'error': 'not judged', 'pending': 'not judged (timed out)',
+           'skipped': 'not inspected'}
 
 
 def _segment_summary(verdicts: List[Verdict]) -> str:
@@ -77,11 +78,11 @@ def write_report(out_dir: str, instruction: str, plan: Optional[Plan], flight_ok
                          f'{v.confidence} | {findings} |')
         lines.append('')
     for v in verdicts:
-        rel = os.path.relpath(v.path, out_dir)
         lines += [f'### {v.label}: {_ANSWER.get(v.needs_attention, v.needs_attention)}'
                   f' ({v.confidence} confidence)', '',
-                  v.findings + (f' Where: {v.where}.' if v.where else ''), '',
-                  f'![{v.label}]({rel})', '']
+                  v.findings + (f' Where: {v.where}.' if v.where else ''), '']
+        if v.path:                # segments not inspected have no photo
+            lines += [f'![{v.label}]({os.path.relpath(v.path, out_dir)})', '']
     if plan is not None:
         lines += ['## Plan', '']
         lines += [f'{i}. {describe(s)}' for i, s in enumerate(plan.skills, 1)]

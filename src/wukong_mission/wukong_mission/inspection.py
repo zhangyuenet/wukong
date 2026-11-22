@@ -34,11 +34,18 @@ class InspectionConfig:
     segment_length: float = 3.0    # m, longest gutter segment per photo
     standoff: float = 4.5          # m, horizontal distance of a viewpoint from the eave
     # m above the gutter lip. The camera sits 0.26 m higher still; at 4.5 m this
-    # puts the gutter ~11 deg below centre, well inside the +-21 deg vertical FOV,
-    # and above the lip, so debris standing in the gutter is visible.
-    # 视点比水槽外沿高 0.6 米（相机再高 0.26 米），水槽在画面中心下方约 11 度。
-    above_gutter: float = 0.6
+    # puts the gutter ~14.5 deg below centre, inside the +-21 deg vertical FOV,
+    # and looks a little into the channel (from 0.6 m up, clean gutters often
+    # showed only their outer face: "unclear").
+    # 视点比水槽外沿高 0.9 米（相机再高 0.26 米），水槽在画面中心下方约 14.5 度，
+    # 能看到一点槽内；0.6 米时干净的水槽常常只看到外侧面，被判为“看不清”。
+    above_gutter: float = 0.9
     clearance_extra: float = 0.5   # m beyond the safety margin for survey stations
+    # Photograph this far past each measured end of an eave: measured eaves stop
+    # a little short at gable ends, and gutter ends (by the downspouts) are where
+    # debris collects. 每条屋檐两端多拍这么远：测得的屋檐在山墙端会短一点，
+    # 而水槽两端（落水管旁）正是最容易积杂物的地方。
+    end_margin: float = 0.3
 
 
 @dataclass
@@ -201,3 +208,117 @@ def inspection_skills(est: HouseEstimate, here: Point, home: Point, limits: Limi
         skills.append(GoTo(round(corner[0], 2), round(corner[1], 2), alt))
     skills.append(GoTo(round(exit_pt[0], 2), round(exit_pt[1], 2), alt))
     return skills, new_limits, targets
+
+
+# -- M3: eaves of any building, paths around anything ---------------------------------------
+
+@dataclass
+class Skipped:
+    """A gutter segment that will not be photographed, and why."""
+
+    label: str
+    gutter: str
+    segment: int
+    start: Point
+    end: Point
+    reason: str
+
+
+def _extended(e: Eave, margin: float) -> Eave:
+    """Return the eave lengthened by margin at both ends."""
+    if margin <= 0 or e.length < 1e-6:
+        return e
+    dn = (e.end[0] - e.start[0]) / e.length
+    de = (e.end[1] - e.start[1]) / e.length
+    return Eave(e.name, (round(e.start[0] - dn * margin, 3), round(e.start[1] - de * margin, 3)),
+                (round(e.end[0] + dn * margin, 3), round(e.end[1] + de * margin, 3)),
+                e.height, e.side_bearing_deg)
+
+
+def plan_inspection(eaves: Sequence[Eave], surfaces, here: Tuple[float, float, float],
+                    home: Point, limits: Limits, cfg: InspectionConfig = InspectionConfig(),
+                    view=None) -> Tuple[List[Skill], Dict[str, PhotoTarget], List[Skipped]]:
+    """
+    Photograph every segment of the given eaves, flying around whatever is there.
+
+    surfaces: HeightFields of everything seen (for line of sight); limits must
+    already contain them as no-fly zones. Ends at home's position at a safe
+    altitude, so a following ReturnHome only has to land.
+    对给定屋檐逐段拍照；无法拍摄的段记录原因后跳过。最后回到起飞点上方。
+    """
+    from .pathplan import choose_viewpoint, Planner, route_home, ViewConfig
+    planner = Planner(limits)
+    view = view or ViewConfig()
+    skills: List[Skill] = []
+    targets: Dict[str, PhotoTarget] = {}
+    skipped: List[Skipped] = []
+
+    # Viewpoints for every segment first. 先为每一段选好视点。
+    plans = []
+    for e in eaves:
+        e = _extended(e, cfg.end_margin)
+        n = segments_for(e, cfg.segment_length)
+        views = []
+        for i, (a, b) in enumerate(segment_eave(e, n), 1):
+            label = f'{e.name} segment {i} of {n}'
+            mid = ((a[0] + b[0]) / 2, (a[1] + b[1]) / 2)
+            vp = choose_viewpoint(planner, mid, e.height, e.outward, surfaces, view)
+            if vp is None:
+                skipped.append(Skipped(label, e.name, i, a, b,
+                                       'no safe viewpoint that can see it'))
+                continue
+            views.append((label, i, n, a, b, mid, vp))
+        if views:
+            plans.append((e, views))
+
+    pos = here
+    while plans:
+        # Nearest eave next, entered from its nearer end. 先去最近的屋檐，从较近的一端开始。
+        best = min(range(len(plans)), key=lambda k: min(
+            math.dist(pos, plans[k][1][0][6]), math.dist(pos, plans[k][1][-1][6])))
+        e, views = plans.pop(best)
+        if math.dist(pos, views[-1][6]) < math.dist(pos, views[0][6]):
+            views = views[::-1]
+        for label, i, n, a, b, mid, vp in views:
+            route = planner.path(pos, vp)
+            if route is None:
+                skipped.append(Skipped(label, e.name, i, a, b, 'no safe path to its viewpoint'))
+                continue
+            for p in route[:-1]:
+                skills.append(GoTo(*p))
+            skills.append(GoTo(*vp, look_at=(round(mid[0], 2), round(mid[1], 2))))
+            skills.append(TakePhoto(label))
+            targets[label] = PhotoTarget(label, e.name, i, n, a, b, e.height, vp)
+            pos = vp
+    # Back above home, at an altitude from which the way is clear. 回到起飞点上方。
+    route = route_home(planner, pos, home)
+    if route is None:
+        skipped.append(Skipped('return', '', 0, home, home, 'no safe path home found'))
+    else:
+        skills += [GoTo(*p) for p in route]
+    return skills, targets, skipped
+
+
+def surfaces_from_heightmap(hm, res: float = 0.5, min_height: float = 0.8,
+                            name: str = 'surroundings'):
+    """
+    Convert a perception HeightMap (numpy) to a flight-layer HeightField no-fly zone.
+
+    Cells are max-pooled to about `res` (a whole number of the map's cells, on
+    the map's own origin, so each coarse cell covers exactly its fine cells).
+    Only cells at least min_height above the ground are kept, and heights are
+    put back into the altitude frame the vehicle flies in (ground_level added).
+    把感知的高度图按最大值降采样为飞行层的高度场禁飞区，高度换回飞行使用的高度坐标系。
+    """
+    import numpy as np
+    from wukong_flight.skills import HeightField
+    k = max(1, int(round(res / hm.res)))
+    top = np.nan_to_num(hm.top, nan=-np.inf)
+    r, c = top.shape
+    r2, c2 = -(-r // k), -(-c // k)
+    pad = np.full((r2 * k, c2 * k), -np.inf)
+    pad[:r, :c] = top
+    pooled = pad.reshape(r2, k, c2, k).max(axis=(1, 3))
+    cells = {(int(i), int(j)): float(pooled[i, j]) + hm.ground_level
+             for i, j in zip(*np.nonzero(pooled >= min_height))}
+    return HeightField(hm.origin, k * hm.res, cells, name)

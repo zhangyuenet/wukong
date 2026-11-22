@@ -61,12 +61,8 @@ export PX4_GZ_WORLD="$WORLD"
 export GZ_SIM_RESOURCE_PATH="$WUKONG_ROOT/sim/models${GZ_SIM_RESOURCE_PATH:+:$GZ_SIM_RESOURCE_PATH}"
 echo "[sim] model $MODEL, world $WORLD"
 
-# Warn when PX4 flight logs (.ulg) pile up. PX4 日志过多时提醒清理。
-PX4_LOG_GB=$(du -s --block-size=1G "$ROOTFS/log" 2>/dev/null | cut -f1 || echo 0)
-if [ "${PX4_LOG_GB:-0}" -ge 5 ]; then
-    echo "[sim] WARNING: PX4 logs use ${PX4_LOG_GB} GB in $ROOTFS/log"
-    echo "[sim]          delete old ones with: rm -rf $ROOTFS/log/*"
-fi
+# Trim old logs to their limits (see scripts/clean_logs.sh). 启动前把旧日志清理到上限以内。
+"$WUKONG_ROOT/scripts/clean_logs.sh" || true
 
 # Refuse to start a second simulation. The cleanup below shuts down PX4 and
 # Gazebo by name, so a second copy exiting would also stop the first one.
@@ -125,6 +121,19 @@ fi
             "$BIN/px4-param" set NAV_DLL_ACT 0 >/dev/null 2>&1 \
                 && echo "[sim] NAV_DLL_ACT set to 0 (sim only, no GCS needed to arm)"
         fi
+        # Magnetometer: PX4 learns a bias in flight and saves it on disarm. Over
+        # dozens of simulated flights it drifted to 0.25 G (half the Earth's
+        # field); the corrected field then looked "disturbed", the heading never
+        # aligned and the EKF refused GPS. The simulated sensor needs no
+        # calibration: start every simulation from zero and do not save.
+        # Sim only: a real drone needs its real calibration.
+        # 磁力计：PX4 会在飞行中学习偏置并在上锁时保存。几十次仿真飞行后偏置漂到 0.25 高斯，
+        # 磁场被判为受干扰，航向无法对准，EKF 不接受 GPS。仿真传感器不需要校准：每次从零开始、
+        # 不保存。仅限仿真，真机必须使用真实校准。
+        for axis in X Y Z; do
+            "$BIN/px4-param" set "CAL_MAG0_${axis}OFF" 0 >/dev/null 2>&1 || true
+        done
+        "$BIN/px4-param" set SENS_MAG_AUTOCAL 0 >/dev/null 2>&1 || true
         # Log only while armed. PX4 SITL defaults to SDLOG_MODE=1 (from boot until
         # the first disarm), so a sim left idle logs forever: ~1 GB/hour with the
         # SITL profile, which once filled the disk (44 GB). The logger has already
@@ -138,6 +147,28 @@ fi
         "$BIN/px4-logger" start -b 1000 -t -m all >/dev/null 2>&1 \
             && echo "[sim] PX4 logger restarted: logging only while armed"
         break
+    done
+) &
+pids+=($!)
+
+# 2b. Disk guard. A runaway log once filled the disk and crashed the VM. Every 30 s:
+#     stop the PX4 logger if the current .ulg passes ULG_MAX_MB or free space on the
+#     disk drops below MIN_FREE_GB (the simulation keeps running, only logging stops).
+#     磁盘保护：单个 .ulg 超过 ULG_MAX_MB，或磁盘剩余空间低于 MIN_FREE_GB 时，停止 PX4
+#     日志记录（仿真继续运行）。
+ULG_MAX_MB="${ULG_MAX_MB:-500}"
+MIN_FREE_GB="${MIN_FREE_GB:-10}"
+(
+    cd "$ROOTFS"
+    while sleep 30; do
+        newest=$(find log -name '*.ulg' -mmin -1 -printf '%s\n' 2>/dev/null | sort -n | tail -1)
+        free_gb=$(df --block-size=1G --output=avail "$ROOTFS" | tail -1 | tr -d ' ')
+        if [ "${newest:-0}" -gt $((ULG_MAX_MB * 1048576)) ] || [ "$free_gb" -lt "$MIN_FREE_GB" ]; then
+            "$BIN/px4-logger" stop >/dev/null 2>&1 || true
+            echo "[sim] WARNING: PX4 logger stopped (current log $((${newest:-0} / 1048576)) MB," \
+                 "${free_gb} GB free). Free space, then restart the simulation." >&2
+            break
+        fi
     done
 ) &
 pids+=($!)

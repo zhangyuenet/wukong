@@ -64,12 +64,17 @@ class MissionNode(Node):
             from .camera import Camera   # Pillow only needed when taking photos
             self.camera = Camera(self)
         self._last_report = 0.0
+        self._had_contact = False
         self.create_timer(1.0 / rate_hz, self._tick)
 
     def _tick(self) -> None:
         if self.mission.finished:
             return
         state = self.link.state()
+        if self._had_contact and not (state.connected and state.position_valid):
+            # Say which messages stopped, to find out why. 记录哪些消息停了，便于查原因。
+            self.get_logger().warn(f'no fresh vehicle state: {self.link.describe_ages()}')
+        self._had_contact = state.connected and state.position_valid
         out = self.mission.step(state)
         if out.setpoint is not None:
             self.link.send_setpoint(out.setpoint)
@@ -109,7 +114,8 @@ class MissionNode(Node):
         if self.on_decide is None:
             self.mission.decide_done(None, why='no decision maker')
             return
-        pose = self._pose(state)
+        # Plan from the hold point: the check starts there. 从目标点开始规划，检查也从那里开始。
+        pose = (*self.mission.hold_position(state), state.heading, state.roll, state.pitch)
 
         def work() -> None:
             try:
@@ -168,4 +174,4 @@ def spin_mission(node: MissionNode) -> bool:
             node.get_logger().error(f'mission failed: {node.mission.failure}')
         elif node.mission.phase == Phase.DONE:
             node.get_logger().info('mission complete')
-    return node.mission.phase == Phase.DONE
+    return node.mission.phase == Phase.DONE and not node.mission.failure

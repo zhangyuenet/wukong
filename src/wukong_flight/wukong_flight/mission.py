@@ -20,7 +20,7 @@ import math
 from typing import List, Optional, Sequence, Tuple
 
 from .skills import (check_plan, Decide, describe, GoTo, Hover, Land, Limits, ReturnHome,
-                     Scan, Skill, Takeoff, TakePhoto)
+                     Scan, Skill, Takeoff, TakePhoto, TERMINAL)
 
 
 class Phase(enum.Enum):
@@ -105,6 +105,13 @@ class MissionConfig:
     leg_timeout: float = 30.0              # s per leg, on top of distance / max_speed
     brake_speed: float = 0.3               # m/s, slow enough to start landing
     brake_timeout: float = 5.0             # s, land anyway after this long
+    # A busy computer can delay PX4's messages for a moment: hold the last
+    # setpoint that long before treating it as lost contact.
+    # 机载电脑偶尔会晚一点处理 PX4 的消息：这段时间内保持最后的设定点，之后才算失联。
+    contact_grace: float = 1.0             # s
+    # Landing without any word from PX4 for this long: stop, PX4's failsafe is in charge.
+    # 降落阶段持续这么久收不到 PX4 的消息：结束任务，由 PX4 的失效保护处置。
+    lost_timeout: float = 60.0             # s
 
     def __post_init__(self) -> None:
         if self.tolerance <= 0 or self.max_speed <= 0:
@@ -191,6 +198,7 @@ class Mission:
         self._answered = False
         self._answer: object = None
         self._land_requested = False
+        self._lost_since: Optional[float] = None     # no fresh, valid vehicle state since
 
     # -- public -------------------------------------------------------------
 
@@ -217,6 +225,10 @@ class Mission:
         """
         Answer a Decide skill: the skills to insert, or None to insert nothing.
 
+        Skills ending with ReturnHome or Land replace the rest of the plan
+        (the decision then gives its own complete, checked way home); other
+        skills are inserted before the rest.
+
         limits replaces the mission's limits from now on (e.g. a no-fly box
         measured by perception instead of a rough one). Both are checked
         together, on the next step, before anything changes.
@@ -232,6 +244,20 @@ class Mission:
         if self.frame == 'local':
             return s.x, s.y, alt
         return s.x - self._home.x, s.y - self._home.y, alt
+
+    def hold_position(self, s: VehicleState) -> Tuple[float, float, float]:
+        """
+        Where the vehicle is meant to be (the current target), in plan coordinates.
+
+        In-flight decisions are checked from here, so plan them from here too:
+        the vehicle itself hovers up to the arrival tolerance away.
+        飞行中的决定从目标点开始检查，所以也要从目标点开始规划；飞机本身悬停时可能偏开
+        到达容差那么远。
+        """
+        if self._target is None:
+            return self.plan_position(s)
+        return self.plan_position(replace(s, x=self._target.x, y=self._target.y,
+                                          z=self._target.z))
 
     def to_ned(self, north: float, east: float, altitude: float) -> Tuple[float, float, float]:
         """Plan coordinates -> PX4 local NED setpoint."""
@@ -270,6 +296,7 @@ class Mission:
         PX4 的降落模式不会先刹车，7 m/s 时中断会再滑出约 30 米，所以先悬停再降落。
         """
         assert self._target is not None
+        self.failure = self.failure or why      # landing before the plan is done
         here = Setpoint(s.x, s.y, s.z, self._target.yaw)
         self._target = self._carrot = here
         self._enter(Phase.BRAKE, s, out, why)
@@ -344,17 +371,32 @@ class Mission:
         if self._phase_start is None:
             self._phase_start = s.t
         cfg = self.config
+        if s.connected and s.position_valid:
+            self._lost_since = None
+        elif self._lost_since is None:
+            self._lost_since = s.t
+        lost_for = 0.0 if self._lost_since is None else s.t - self._lost_since
+        holding = False
 
         # Safety checks while we are the one flying. 飞行中的安全检查。
         if self.phase in FLYING_PHASES:
-            if not s.armed:
+            # Lost contact first: without fresh messages, armed/offboard read as
+            # False and must not be taken for a disarm or a pilot takeover.
+            # 先判断是否失去通信：收不到消息时“已解锁”“offboard”都读作 False，
+            # 不能当成上锁或遥控接管。
+            if self._lost_since is not None and lost_for < cfg.contact_grace:
+                holding = True       # keep streaming the last setpoint, wait
+            elif self._lost_since is not None:
+                # Cannot brake without a position: let PX4 land where it is.
+                # 没有位置就无法刹车：直接让 PX4 原地降落。
+                self.failure = self.failure or f'lost vehicle state for {lost_for:.1f} s'
+                self._enter(Phase.LAND, s, out, 'lost vehicle state')
+            elif not s.armed:
                 self._abort(s, out, 'vehicle disarmed')
             elif not s.offboard:
                 # A pilot or a PX4 failsafe switched modes: never fight it.
                 # 遥控接管或 PX4 失效保护切换了模式：不要抢回控制权。
                 self._abort(s, out, 'left offboard mode, PX4 or pilot in control')
-            elif not s.connected or not s.position_valid:
-                self._enter(Phase.LAND, s, out, 'lost vehicle state')
             elif self.phase == Phase.BRAKE:
                 pass
             elif self._land_requested:
@@ -402,6 +444,9 @@ class Mission:
                 if not s.armed:
                     out.commands.append(Command.ARM)
 
+        elif holding:
+            pass
+
         elif self.phase == Phase.RUNNING:
             self._run_skill(s, out)
 
@@ -412,7 +457,16 @@ class Mission:
                 self._enter(Phase.LAND, s, out, f'brake timed out at {s.speed:.1f} m/s')
 
         if self.phase == Phase.LAND:
-            if not s.armed and s.landed:
+            if not s.connected:
+                # Without messages, armed and landed read as their defaults: they
+                # say nothing. Keep asking PX4 to land; it may still hear us.
+                # 收不到消息时“未解锁”“已落地”只是默认值，不能当真。继续发降落指令。
+                if lost_for > cfg.lost_timeout:
+                    self._abort(s, out, f'no word from PX4 for {lost_for:.0f} s while '
+                                        f'landing; PX4 failsafe in charge')
+                elif self._retry_due(s):
+                    out.commands.append(Command.LAND)
+            elif not s.armed and s.landed:
                 self._enter(Phase.DONE, s, out, 'landed and disarmed')
             elif not s.landing and s.armed and self._retry_due(s):
                 out.commands.append(Command.LAND)
@@ -420,7 +474,8 @@ class Mission:
         # Keep streaming setpoints in every phase where offboard is (or will be) active.
         # 在需要 offboard 的阶段持续发送设定点，PX4 收不到会触发失效保护。
         if self.phase in (Phase.PRESTREAM, Phase.ARMING) + FLYING_PHASES:
-            self._move_carrot(s)
+            if not holding:
+                self._move_carrot(s)
             out.setpoint = self._carrot
         self._last_t = s.t
         return out
@@ -448,9 +503,15 @@ class Mission:
             out.events.append(f'decide "{label}": nothing added' + (f' ({why})' if why else ''))
             return
         assert self._target is not None
-        here = self.plan_position(replace(s, x=self._target.x, y=self._target.y,
-                                          z=self._target.z))
-        rest = list(skills) + self.plan[self.index + 1:]
+        here = self.hold_position(s)
+        # Skills that already end the mission (return home / land) replace what
+        # was left; others are inserted before it. Either way the whole rest
+        # must pass the check from here, or nothing changes.
+        # 以返航或降落结尾的技能替换剩余计划，否则插在剩余计划之前；都必须从当前位置通过检查。
+        if isinstance(skills[-1], TERMINAL):
+            rest = list(skills)
+        else:
+            rest = list(skills) + self.plan[self.index + 1:]
         new_limits = limits if limits is not None else self.limits
         check = check_plan(rest, new_limits, self.start, initial=here)
         if not check.ok:
@@ -480,7 +541,7 @@ class Mission:
             kind, log = (('photo', self.photos) if isinstance(skill, TakePhoto)
                          else ('scan', self.scans))
             if self._asked_t is None:
-                if self._settled(s, kind == 'scan'):
+                if self._settled(s, kind == 'scan' or getattr(skill, 'steady', False)):
                     self._asked_t = s.t
                     setattr(out, kind, skill.label)
             elif self._answered:

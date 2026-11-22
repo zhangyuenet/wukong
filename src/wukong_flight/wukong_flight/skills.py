@@ -19,7 +19,7 @@ Altitude is always metres above the takeoff point, up positive.
 
 from dataclasses import dataclass, field
 import math
-from typing import List, Optional, Sequence, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 
 @dataclass(frozen=True)
@@ -50,9 +50,20 @@ class Hover:
 
 @dataclass(frozen=True)
 class TakePhoto:
-    """Settle, then take one photo with the forward camera."""
+    """
+    Settle, then take one photo with the forward camera.
+
+    steady: wait as for a depth scan (heading within a degree, still for a
+    second). For photos whose pixels are mapped back onto the world with the
+    recorded pose (the ruler on the house overview): the frame arrives a few
+    hundred ms after the request, and a drone still turning made the drawn
+    ruler miss the house by ~9 degrees. 等到像深度扫描一样稳定再拍：照片要用记录的
+    位姿反投影时（全景照上的刻度尺）使用。照片比请求晚几百毫秒到达，飞机还在转动时，
+    刻度尺曾与画面偏差约 9 度。
+    """
 
     label: str
+    steady: bool = False
 
 
 @dataclass(frozen=True)
@@ -160,7 +171,63 @@ class Cylinder:
                 and math.hypot(north - self.center[0], east - self.center[1]) <= self.radius)
 
 
-NoFly = Union[Box, RotatedBox, Cylinder]
+class HeightField:
+    """
+    Everything seen above the ground, as a grid of heights: a no-fly zone of any shape.
+
+    cells maps (i, j) -> top height; cell (i, j) covers north origin[0] + i*res
+    .. + res, east likewise. Heights are in the plan's altitude frame. Built by
+    perception from the survey points (houses, neighbours, trees alike); plain
+    Python so the flight layer needs no numpy.
+    把地面以上看到的一切表示为高度栅格，作为任意形状的禁飞区（房屋、邻居、树木都一样）。
+    """
+
+    def __init__(self, origin: Tuple[float, float], res: float,
+                 cells: Dict[Tuple[int, int], float], name: str = 'surroundings') -> None:
+        self.origin = (float(origin[0]), float(origin[1]))
+        self.res = float(res)
+        self.cells = dict(cells)
+        self.name = name
+        self._inflated: Dict[float, 'HeightField'] = {}
+
+    @property
+    def top(self) -> float:
+        return max(self.cells.values()) if self.cells else 0.0
+
+    def cell(self, north: float, east: float) -> Tuple[int, int]:
+        return (int(math.floor((north - self.origin[0]) / self.res)),
+                int(math.floor((east - self.origin[1]) / self.res)))
+
+    def height_at(self, north: float, east: float) -> Optional[float]:
+        return self.cells.get(self.cell(north, east))
+
+    def contains(self, north: float, east: float, altitude: float) -> bool:
+        h = self.cells.get(self.cell(north, east))
+        return h is not None and altitude <= h
+
+    def inflated(self, margin: float) -> 'HeightField':
+        """Grow by margin sideways (a disk) and upwards. Cached per margin."""
+        key = round(margin, 3)
+        if key in self._inflated:
+            return self._inflated[key]
+        # A cell is blocked if any point of it is within margin of a blocked
+        # cell: reach = margin plus one cell diagonal, to stay conservative.
+        k = int(math.ceil(margin / self.res + math.sqrt(2)))
+        offsets = [(di, dj) for di in range(-k, k + 1) for dj in range(-k, k + 1)
+                   if max(0.0, math.hypot(di, dj) - math.sqrt(2)) * self.res <= margin]
+        out: Dict[Tuple[int, int], float] = {}
+        for (i, j), h in self.cells.items():
+            t = h + margin
+            for di, dj in offsets:
+                c = (i + di, j + dj)
+                if out.get(c, -math.inf) < t:
+                    out[c] = t
+        hf = HeightField(self.origin, self.res, out, self.name)
+        self._inflated[key] = hf
+        return hf
+
+
+NoFly = Union[Box, RotatedBox, Cylinder, HeightField]
 
 
 @dataclass(frozen=True)

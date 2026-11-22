@@ -93,3 +93,27 @@ def test_continuation_check_starts_from_current_position():
     assert not check_plan([Takeoff(5), ReturnHome()], LIMITS, initial=(8, 0, 5)).ok
     errors = check_plan([GoTo(25, 0, 5), ReturnHome()], LIMITS, initial=(8, 0, 5)).errors
     assert any('no-fly box house' in e for e in errors)
+
+
+def test_height_field_blocks_paths_over_low_and_high_parts():
+    from wukong_flight.skills import HeightField
+    # An L-shaped building: a 6 m main part and a 3 m annex, 0.5 m cells.
+    cells = {}
+    for i in range(20, 36):             # north 10..18
+        for j in range(-10, 10):        # east -5..5
+            cells[(i, j)] = 6.0
+    for i in range(20, 30):             # annex east of it: north 10..15, east 5..10
+        for j in range(10, 20):
+            cells[(i, j)] = 3.0
+    hf = HeightField((0.0, 0.0), 0.5, cells, 'house')
+    assert hf.contains(12, 0, 5.9) and not hf.contains(12, 0, 6.1)
+    assert hf.contains(12, 7, 2.9) and not hf.contains(12, 7, 3.1)
+    lim = Limits(no_fly=(hf,))
+    # Over the annex at 4.5 m: within 2 m of its 3 m roof -> rejected; at 5.5 m fine.
+    assert not check_plan([Takeoff(4.5), GoTo(12, 7.5, 4.5), Land()], lim, start=(0, 7.5)).ok
+    assert check_plan([Takeoff(5.5), GoTo(9, 12.5, 5.5), ReturnHome()], lim,
+                      start=(0, 12.5)).ok
+    # Margin is kept sideways too: 1.5 m south of the wall is too close. Grid
+    # cells make it up to one cell diagonal more conservative, never less.
+    assert not check_plan([Takeoff(4), GoTo(8.5, 0, 4), Land()], lim).ok
+    assert check_plan([Takeoff(4), GoTo(7.0, 0, 4), ReturnHome()], lim).ok

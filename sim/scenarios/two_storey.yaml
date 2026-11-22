@@ -1,0 +1,39 @@
+# A two-storey detached house with an attached garage and a front porch.
+# 两层独立屋，带车库和门廊。正门朝南，面向起飞点。
+seed: 11
+target: house
+buildings:
+  - name: house
+    center: [17.0, 0.0]          # north, east of the takeoff point
+    bearing: 90                  # main ridge runs east-west; "right" (-y) faces south
+    blocks:
+      - name: main               # two storeys, hip roof: gutters on all four sides
+        size: [12.0, 9.0]
+        wall_height: 5.8
+        roof: hip
+        pitch: 28
+        gutters:
+          right: [clean, leaves, clean, clean]   # south, front
+          left:  [clean, clean, blocked, clean]  # north, back
+          end:   [clean, clean, clean]           # east
+          start: [clean, clean, clean]           # west
+      - name: garage             # one storey, attached on the east end
+        offset: [8.75, -1.0]
+        size: [5.5, 7.0]
+        wall_height: 2.8
+        roof: gable
+        pitch: 25
+        details: false
+        gutters:
+          right: [clean, blocked]
+          left:  [clean, clean]
+      - name: porch              # open porch on posts in front of the door
+        offset: [0.0, -5.6]
+        size: [4.0, 2.2]
+        wall_height: 2.6
+        roof: shed
+        pitch: 15
+        posts: true
+        low_side: right
+        gutters:
+          right: [leaves]

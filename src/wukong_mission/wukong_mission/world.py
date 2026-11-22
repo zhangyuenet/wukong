@@ -74,6 +74,17 @@ class WorldMap:
     camera_hfov_deg: float
     camera_vfov_deg: float
     rough_houses: Tuple[RoughHouse, ...] = ()
+    # M3: no house given; the drone inspects the nearest building it finds
+    # within search_radius of the takeoff point. M3：地图不给房屋，无人机自己找最近的建筑。
+    search_radius: float = 0.0
+    max_building_height: float = 12.0
+    # Confirmed once by the homeowner for a real site (sim: from the scenario):
+    # the target is one unit of a townhouse row. 用户确认过的场地信息：目标是联排中的一户。
+    townhouse: bool = False
+
+    @property
+    def find_house(self) -> bool:
+        return not self.houses and not self.rough_houses and self.search_radius > 0
 
     def describe(self) -> str:
         """Plain-text map for the planner prompt."""
@@ -94,6 +105,12 @@ class WorldMap:
             lines.append(f'- {r.name}: exact shape unknown; it lies within {r.radius:g} m of '
                          f'{r.approx_center} and is at most {r.max_height:g} m tall. Its shape '
                          f'and gutters are measured in flight by the survey_house skill.')
+        if self.find_house:
+            lines.append(f'No house positions are known. In flight the drone looks around from '
+                         f'above the takeoff point and inspects the building nearest to it '
+                         f'(within {self.search_radius:g} m): "the house next to you", "this '
+                         f'house" mean that building. It can find gutters on every level of '
+                         f'it, and tell which compass direction each one faces.')
         lim = self.limits
         lines.append(
             f'Flight limits: altitude {lim.min_altitude:g}..{lim.max_altitude:g} m above the '
@@ -143,4 +160,7 @@ def load_world(path: str) -> WorldMap:
     return WorldMap(name=str(data.get('name', 'map')), houses=tuple(houses), limits=limits,
                     camera_hfov_deg=float(cam.get('horizontal_fov_deg', 90)),
                     camera_vfov_deg=float(cam.get('vertical_fov_deg', 60)),
-                    rough_houses=tuple(rough))
+                    rough_houses=tuple(rough),
+                    search_radius=float(data.get('search_radius', 0.0)),
+                    max_building_height=float(data.get('max_building_height', 12.0)),
+                    townhouse=bool((data.get('site') or {}).get('townhouse', False)))

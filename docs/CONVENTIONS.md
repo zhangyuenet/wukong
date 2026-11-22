@@ -82,6 +82,39 @@ wukong/                   仓库本身就是 colcon 工作空间
 - 涉及飞行行为的改动，除单元测试外，还要在仿真中实际飞一次。
 - 运行：`colcon test --packages-select <包名> && colcon test-result --verbose`
 
+### 7.1 日志和测试遗留文件
+
+开发虚拟机的磁盘只有 78 GB。2026-11-20 一个没关的仿真让 PX4 写出了 44 GB 的
+`.ulg`，磁盘写满，虚拟机崩溃。所以日志有硬性上限，测试做完要清理。
+
+**上限**（由 [scripts/clean_logs.sh](../scripts/clean_logs.sh) 执行，可用环境变量调整）：
+
+| 内容 | 位置 | 保留 |
+|---|---|---|
+| PX4 飞行日志 | `PX4-Autopilot/build/px4_sitl_default/rootfs/log/` | 最新 3 个，总量不超过 1 GB |
+| 评测结果 | `log/eval_m2/<时间>/` | 最新 3 次 + 带 `KEEP` 文件的 |
+| 任务结果 | `log/missions/<时间>/` | 最新 5 次 + 带 `KEEP` 文件的 + 手动命名的目录 |
+| colcon 日志 | `log/build_*`、`log/test_*` | 每类最新 2 个 |
+| ROS 2 节点日志 | `~/.ros/log/` | 7 天 |
+
+**自动执行的保护**：
+
+- `sim.sh` 每次启动先运行 `clean_logs.sh`。
+- `sim.sh` 运行期间每 30 秒检查一次：当前 `.ulg` 超过 500 MB 或磁盘剩余不足
+  10 GB 时，停止 PX4 日志记录（仿真继续）。
+- `eval_m2.sh` 结束时运行 `clean_logs.sh`。
+- PX4 只在解锁期间记录日志（`SDLOG_MODE=0`，由 `sim.sh` 设置）。
+
+**每次测试结束后**（人和 AI 助手都适用）：
+
+1. 停掉仿真，确认没有残留进程：`pgrep -af 'px4|gz sim|MicroXRCE'` 没有输出。
+2. 运行 `./scripts/clean_logs.sh`。
+3. 只保留后续开发需要的结果：证明里程碑完成、或要拿来对比的那次运行，放一个
+   `KEEP` 文件并写明原因，例如 `echo "M3 passed" > log/eval_m2/<时间>/KEEP`。
+   其余的诊断图、中间数据、临时脚本输出，用完就删。
+4. 大体积的临时文件（图片、点云、`.npy`）放在 `/tmp` 或 `scratch/`（不提交），
+   用完删除，不要散落在仓库里。
+
 ## 8. 提交
 
 - 提交信息用英文，第一行概括改动，正文说明原因。

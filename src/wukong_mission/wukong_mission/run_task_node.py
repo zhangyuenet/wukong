@@ -33,7 +33,9 @@ from wukong_flight.px4_link import Px4Link
 from wukong_flight.skills import describe
 
 from . import llm
+from .classify import ClaudeClassifier, TruthClassifier
 from .gutter_task import GutterTask
+from .house_task import HouseTask
 from .judge import ClaudeJudge, FakeJudge, Verdict
 from .planner import (ClaudePlanner, GutterPlanner, OfflineGutterPlanner, Plan, PlanningError,
                       ScriptedPlanner)
@@ -45,6 +47,53 @@ def _default_world() -> str:
     from ament_index_python.packages import get_package_share_directory
     return os.path.join(get_package_share_directory('wukong_mission'), 'config',
                         'sim_house.yaml')
+
+
+def _running_world() -> Optional[str]:
+    """Name of the Gazebo world being simulated, or None (no Gazebo, or not found)."""
+    import subprocess
+    try:
+        out = subprocess.run(['gz', 'topic', '-l'], capture_output=True, text=True,
+                             timeout=8).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    for line in out.splitlines():
+        parts = line.strip().split('/')
+        if len(parts) == 4 and parts[1] == 'world' and parts[3] == 'clock':
+            return parts[2]
+    return None
+
+
+def _choose_map(args, running: Optional[str], say) -> Tuple[Optional[str], str]:
+    """
+    Pick the map that belongs to the simulated world; refuse a mismatch.
+
+    Returns (map path, problem). Without --world/--scenario the running world
+    decides: wukong_<scenario> uses sim/generated/<scenario>/map.yaml, anything
+    else the default sim house map.
+    地图必须与正在仿真的世界一致；没有指定时按正在运行的世界自动选择。
+    """
+    root = os.environ.get('WUKONG_ROOT', '.')
+
+    def scenario_map(name):
+        return os.path.join(root, 'sim', 'generated', name, 'map.yaml')
+    if args.scenario:
+        path, expect = scenario_map(args.scenario), f'wukong_{args.scenario}'
+    elif args.world:
+        path, expect = args.world, None
+    elif running and running.startswith('wukong_') and os.path.isfile(
+            scenario_map(running[len('wukong_'):])):
+        path, expect = scenario_map(running[len('wukong_'):]), running
+        say(f'[run_task] simulated world is {running}: using {path}')
+    else:
+        path, expect = _default_world(), 'wukong_house'
+    if not os.path.isfile(path):
+        return None, f'map not found: {path}'
+    if running and expect and running != expect:
+        return None, (f'the map is for world {expect}, but the simulation runs {running}. '
+                      f'Restart the simulation with that world, or drop --scenario to use '
+                      f'the map of the running one.')
+    return path, ''
 
 
 def _default_out() -> str:
@@ -108,7 +157,16 @@ def _run_gutters(args, world, start, out_dir, say) -> int:
             judge = ClaudeJudge(args.model, args.effort)
         say(f'[run_task] understanding: "{args.instruction}"')
         request = planner.request(args.instruction)
-        task = GutterTask(world, request, start, out_dir, judge, args.instruction, log=say)
+        if world.find_house:       # M3: find the nearest building in flight
+            task = HouseTask(world, request, start, out_dir, judge, args.instruction, log=say)
+            if not args.offline:   # judge the kind of house from a photo 根据照片判断房屋类型
+                task.classifier = ClaudeClassifier(args.model)
+            else:                  # sim only: the scenario's truth stands in for Claude
+                task.classifier = TruthClassifier.beside(args.map_path)
+                if task.classifier:
+                    say('[run_task] offline: house type from the simulation truth')
+        else:                      # M2: a house at a roughly known position
+            task = GutterTask(world, request, start, out_dir, judge, args.instruction, log=say)
     except (llm.LlmError, PlanningError, ValueError) as e:
         say(f'[run_task] no takeoff: {e}')
         write_report(out_dir, args.instruction, None, False, str(e), [])
@@ -119,7 +177,7 @@ def _run_gutters(args, world, start, out_dir, say) -> int:
     sides = ', '.join(request.sides) or 'all'
     say(f'[run_task] task: {request.understood} (house "{request.house}", gutters: {sides})')
     skills = task.plan()
-    say('[run_task] survey plan, the inspection is planned in flight after the survey:')
+    say('[run_task] first steps; the rest is planned in flight from what the drone sees:')
     for i, s in enumerate(skills, 1):
         say(f'           {i:2d}. {describe(s)}')
     try:
@@ -143,7 +201,28 @@ def _run_gutters(args, world, start, out_dir, say) -> int:
         verdicts = task.collect(args.judge_timeout)
     except KeyboardInterrupt:
         verdicts = task.collect(0.0)
-    plan = Plan(request.understood, list(mission.plan))
+    # Segments the drone could not inspect safely belong in the report too.
+    # 无法安全检查的段也写进报告。
+    for sk in getattr(task, 'skipped', []):
+        if sk.segment:
+            verdicts.append(Verdict(sk.label, '', 'skipped', 'low', f'not inspected: {sk.reason}',
+                                    extra={'gutter': sk.gutter, 'segment': sk.segment,
+                                           'segments': sk.segment, 'from': list(sk.start),
+                                           'to': list(sk.end)}))
+    # Planned photos never taken (the flight ended early) were not inspected either.
+    # 计划了但没拍到的段（飞行提前结束）同样写成“未检查”。
+    seen = {v.label for v in verdicts}
+    for label, t in getattr(task, 'targets', {}).items():
+        if label not in seen:
+            verdicts.append(Verdict(label, '', 'skipped', 'low',
+                                    'not inspected: the flight ended before this photo',
+                                    extra={'gutter': t.gutter, 'segment': t.segment,
+                                           'segments': t.segments, 'from': list(t.start),
+                                           'to': list(t.end), 'height': t.height}))
+    understood = request.understood
+    if getattr(task, 'house', None) is not None:
+        understood += f' House: {task.house.describe()}. {task.house.notes}'
+    plan = Plan(understood, list(mission.plan))
     md = write_report(out_dir, args.instruction, plan, flight_ok, note, verdicts)
     say(f'[run_task] {summary_line(verdicts)}')
     say(f'[run_task] report: {md}')
@@ -154,11 +233,17 @@ def main(argv=None) -> int:
     args = _parse_args(remove_ros_args(sys.argv if argv is None else argv)[1:])
     out_dir = args.out or _default_out()
     os.makedirs(out_dir, exist_ok=True)
-    if args.scenario:
-        args.world = os.path.join(os.environ.get('WUKONG_ROOT', '.'), 'sim', 'generated',
-                                  args.scenario, 'map.yaml')
-    world = load_world(args.world or _default_world())
     say = functools.partial(print, flush=True)   # keep order with ROS logs
+    map_path, problem = _choose_map(args, _running_world(), say)
+    if problem:
+        say(f'[run_task] {problem}')
+        return 2
+    args.map_path = map_path
+    world = load_world(map_path)
+    if not world.houses and not world.rough_houses and not world.find_house:
+        say('[run_task] this map names no house and no search radius: nothing to inspect. '
+            'No takeoff.')
+        return 2
 
     rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
     try:
@@ -168,7 +253,7 @@ def main(argv=None) -> int:
             say('[run_task] no vehicle position from PX4 (is ./scripts/sim.sh running?)')
             return 2
         say(f'[run_task] drone at north {start[0]:.1f}, east {start[1]:.1f}')
-        if world.rough_houses:
+        if world.rough_houses or world.find_house:
             return _run_gutters(args, world, start, out_dir, say)
 
         # 2. Plan, on the ground. 在地面上完成规划。

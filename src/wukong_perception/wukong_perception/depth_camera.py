@@ -15,7 +15,7 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import CameraInfo, Image
 
-from .geometry import depth_to_points, Intrinsics
+from .geometry import depth_rays, depth_to_points, Intrinsics
 
 Pose = Tuple[float, float, float, float]   # north, east, height, heading
 
@@ -41,6 +41,9 @@ class DepthCamera:
         self._pending: Optional[tuple] = None
         self.clouds: List[np.ndarray] = []      # every successful capture, in order
         self.labels: List[str] = []
+        self.poses: List[Tuple[float, ...]] = []   # vehicle pose used for each capture
+        self.rays: List[tuple] = []              # (camera, ray ends, hit) per capture
+        self.stamps: List[float] = []            # image time stamp, s
         node.create_subscription(CameraInfo, info_topic, self._on_info, qos_profile_sensor_data)
         node.create_subscription(Image, image_topic, self._on_image, qos_profile_sensor_data)
 
@@ -63,10 +66,15 @@ class DepthCamera:
         label, pose, done = self._pending
         self._pending = None
         try:
-            pts = depth_to_points(image_to_depth(msg), self._k, pose)
+            depth = image_to_depth(msg)
+            pts = depth_to_points(depth, self._k, pose)
+            rays = depth_rays(depth, self._k, pose)
         except ValueError:
             done(False)
             return
+        self.rays.append(rays)
         self.clouds.append(pts)
         self.labels.append(label)
+        self.poses.append(tuple(float(v) for v in pose))
+        self.stamps.append(msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9)
         done(len(pts) > 0)

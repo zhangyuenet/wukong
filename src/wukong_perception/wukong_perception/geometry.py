@@ -113,6 +113,38 @@ def project(points: np.ndarray, k: Intrinsics, pose: Sequence[float],
     return np.column_stack([u, v, fwd])
 
 
+def depth_rays(depth: np.ndarray, k: Intrinsics, pose: Sequence[float],
+               offset_frd: Tuple[float, float, float] = CAMERA_OFFSET_FRD,
+               stride: int = 4, max_range: float = 18.5):
+    """
+    Return the camera position and every sampled ray of a depth image.
+
+    (camera (north, east, height), ends (N, 3), hit (N,)): a ray with a return
+    ends at the point it hit; one without (nothing within max_range) ends at
+    max_range along its direction, and the space it crossed is just as empty.
+    返回相机位置和每条射线：有回波的终点是击中点；没有回波的终点取最大量程处，
+    它经过的空间同样是空的。
+    """
+    d = depth[::stride, ::stride].astype(np.float64)
+    h, w = d.shape
+    v, u = np.mgrid[0:h, 0:w]
+    u, v = u.ravel() * stride, v.ravel() * stride
+    d = d.ravel()
+    hit = np.isfinite(d) & (d > 0.05) & (d < max_range)
+    x, y = (u - k.cx) / k.fx, (v - k.cy) / k.fy
+    # Rays without a return: as far as max_range along the ray (z-depth = range / norm).
+    norm = np.sqrt(1 + x * x + y * y)
+    d = np.where(hit, d, max_range / norm)
+    body = np.vstack([d + offset_frd[0], x * d + offset_frd[1], y * d + offset_frd[2]])
+    n0, e0, h0, yaw = pose[:4]
+    roll, pitch = (pose[4], pose[5]) if len(pose) >= 6 else (0.0, 0.0)
+    r = body_to_ned(roll, pitch, yaw)
+    ned = r @ body
+    cam = r @ np.array(offset_frd)
+    ends = np.column_stack([n0 + ned[0], e0 + ned[1], h0 - ned[2]])
+    return (n0 + cam[0], e0 + cam[1], h0 - cam[2]), ends, hit
+
+
 @dataclass
 class Eave:
     """One eave edge of the roof, where a gutter hangs."""

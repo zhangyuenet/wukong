@@ -1,0 +1,26 @@
+# Four townhouses with hip ends; the target is the east end unit, which has
+# gutters on three sides (front, back and the east end).
+# 四户联排、两端为四坡顶，目标是东端户，三面都有水槽。
+seed: 31
+target: "row:4"
+buildings:
+  - name: row
+    type: row
+    center: [16.0, -14.5]       # unit 4 (east end) is centred 4.75 m west of the takeoff point
+    bearing: 90
+    units: 4
+    unit_width: 6.5
+    depth: 10.0
+    wall_height: 5.6
+    roof: hip
+    unit_gutters:
+      3: {right: [leaves, clean]}
+      4: {right: [clean, clean], left: [blocked, clean], end: [clean, leaves, clean]}
+  - name: neighbour           # a detached house further away, must be ignored
+    center: [30.0, 22.0]
+    bearing: 0
+    blocks:
+      - size: [10.0, 8.0]
+        wall_height: 3.0
+        roof: gable
+        gutters: {left: [leaves, leaves, clean], right: [clean, blocked, clean]}

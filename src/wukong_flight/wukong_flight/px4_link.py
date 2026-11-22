@@ -102,6 +102,17 @@ class Px4Link:
         self._roll = math.atan2(2 * (w * x + y * z), 1 - 2 * (x * x + y * y))
         self._pitch = math.asin(max(-1.0, min(1.0, 2 * (w * y - z * x))))
 
+    def describe_ages(self) -> str:
+        """How old the last status and position messages are, for the log."""
+        t = self._now()
+
+        def age(msg, stamp):
+            return 'never' if msg is None else f'{t - stamp:.2f} s'
+        pos = self._position
+        valid = '' if pos is None else f', xy_valid={pos.xy_valid} z_valid={pos.z_valid}'
+        return (f'status {age(self._status, self._status_t)}, '
+                f'position {age(pos, self._position_t)} old{valid}')
+
     def state(self) -> VehicleState:
         t = self._now()
         st, pos = self._status, self._position
