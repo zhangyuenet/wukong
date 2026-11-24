@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Copyright 2026 Yue Zhang
+# SPDX-License-Identifier: Apache-2.0
 # Step 2: clone PX4, install its dependencies (incl. Gazebo Harmonic), build SITL.
 # 第 2 步：获取 PX4 源码，安装依赖（含 Gazebo Harmonic），编译 SITL。
 set -euo pipefail

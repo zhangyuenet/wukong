@@ -19,7 +19,7 @@ z up, origin at the centre of the footprint on the ground. A block's `side` name
 import math
 import os
 import random
-from typing import Dict, List, Tuple
+from typing import List, Tuple
 
 STATES = ('clean', 'leaves', 'blocked')
 COMPASS = ['north', 'northeast', 'east', 'southeast', 'south', 'southwest', 'west', 'northwest']
@@ -102,7 +102,7 @@ class Writer:
             self.parts.append(f'      <collision name="{nm}_c">{pose}{geo}</collision>\n')
 
     def prism(self, f: Frame, poly, thickness, rgb, base='roof'):
-        """A planar polygon (block-frame points), extruded below its plane: closed mesh."""
+        """Add a planar polygon (block-frame points), extruded below its plane: closed mesh."""
         pts = [f.enu(*p) for p in poly]
         # Normal of the polygon (Newell), pointed upwards (or anywhere if vertical).
         nx = ny = nz = 0.0
@@ -209,7 +209,6 @@ class Block:
 
     def build(self, w: Writer, wall_rgb, details: bool = True) -> None:
         f, L, W, H, o = self.f, self.L, self.W, self.H, self.over
-        t = math.tan(self.pitch)
         L2, W2 = L / 2, W / 2
         if self.posts:
             for sx in (-1, 1):
@@ -222,9 +221,11 @@ class Block:
         if self.roof == 'gable':
             for s in (1, -1):
                 w.prism(f, [(-L2 - o, s * (W2 + o), eh), (L2 + o, s * (W2 + o), eh),
-                            (L2 + o, 0, self.ridge_h), (-L2 - o, 0, self.ridge_h)], 0.12, ROOF_COLOR)
+                            (L2 + o, 0, self.ridge_h), (-L2 - o, 0, self.ridge_h)],
+                        0.12, ROOF_COLOR)
             for sx in (1, -1):   # gable end walls
-                w.prism(f, [(sx * L2, -W2, H), (sx * L2, W2, H), (sx * L2, 0, self.ridge_h - 0.05)],
+                w.prism(f, [(sx * L2, -W2, H), (sx * L2, W2, H),
+                            (sx * L2, 0, self.ridge_h - 0.05)],
                         0.12, wall_rgb, 'gable')
         elif self.roof == 'hip':
             rx = L2 - W2      # ridge half-length
@@ -326,10 +327,10 @@ def _states(spec, side, default_n):
     return [s] if isinstance(s, str) else list(s)
 
 
-# -- buildings ---------------------------------------------------------------------------------------
+# -- buildings -------------------------------------------------------------------------------
 
 def build_house(cfg: dict, idx: int, rng, mesh_dir: str, target: bool):
-    """A detached house: blocks placed relative to the house frame."""
+    """Build a detached house: blocks placed relative to the house frame."""
     name = cfg.get('name', f'house{idx + 1}')
     hf = Frame(tuple(cfg['center']), float(cfg.get('bearing', 90)))
     w = Writer(mesh_dir, name)
@@ -374,7 +375,7 @@ def build_house(cfg: dict, idx: int, rng, mesh_dir: str, target: bool):
 
 
 def build_row(cfg: dict, idx: int, rng, mesh_dir: str, target_unit):
-    """A row of townhouse units under one roof (gable or hip ends)."""
+    """Build a row of townhouse units under one roof (gable or hip ends)."""
     name = cfg.get('name', f'row{idx + 1}')
     n = int(cfg['units'])
     uw = float(cfg.get('unit_width', 6.0))
@@ -392,7 +393,8 @@ def build_row(cfg: dict, idx: int, rng, mesh_dir: str, target_unit):
         xc = x0 + uw / 2
         col = WALL_COLORS[u % len(WALL_COLORS)]
         for s in (1, -1):
-            w.box(rf, xc, s * (depth / 2 + 0.005), b.H / 2, (uw - 0.1, 0.01, b.H), col, base='facade')
+            w.box(rf, xc, s * (depth / 2 + 0.005), b.H / 2, (uw - 0.1, 0.01, b.H), col,
+                  base='facade')
         w.box(rf, xc - uw * 0.25, -depth / 2 - 0.02, 1.05, (1.0, 0.02, 2.1), DOOR, base='door')
         for z in (1.6, b.H - 1.3):
             w.box(rf, xc + uw * 0.2, -depth / 2 - 0.02, z, (1.4, 0.02, 1.0), WINDOW, base='window')

@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Copyright 2026 Yue Zhang
+# SPDX-License-Identifier: Apache-2.0
 # Step 1: install ROS 2 (Jazzy) and base tools.
 # 第 1 步：安装 ROS 2 Jazzy 和基础工具。
 set -euo pipefail

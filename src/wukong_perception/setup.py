@@ -1,3 +1,5 @@
+# Copyright 2026 Yue Zhang
+# SPDX-License-Identifier: Apache-2.0
 from setuptools import find_packages, setup
 
 package_name = 'wukong_perception'

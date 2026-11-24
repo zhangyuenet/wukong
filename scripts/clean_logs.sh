@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Copyright 2026 Yue Zhang
+# SPDX-License-Identifier: Apache-2.0
 # Keep logs and test leftovers under fixed limits.
 # 把日志和测试遗留文件控制在固定上限内。
 #

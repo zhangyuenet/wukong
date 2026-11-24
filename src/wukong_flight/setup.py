@@ -1,3 +1,5 @@
+# Copyright 2026 Yue Zhang
+# SPDX-License-Identifier: Apache-2.0
 from glob import glob
 
 from setuptools import find_packages, setup

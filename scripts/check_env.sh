@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Copyright 2026 Yue Zhang
+# SPDX-License-Identifier: Apache-2.0
 # Check the Wukong development environment. Safe to run any time.
 # 检查 Wukong 开发环境，随时可以运行。
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

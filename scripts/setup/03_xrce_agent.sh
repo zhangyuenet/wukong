@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Copyright 2026 Yue Zhang
+# SPDX-License-Identifier: Apache-2.0
 # Step 3: build and install the Micro XRCE-DDS Agent (bridge between PX4 and ROS 2).
 # 第 3 步：编译安装 Micro XRCE-DDS Agent（PX4 与 ROS 2 之间的桥）。
 set -euo pipefail

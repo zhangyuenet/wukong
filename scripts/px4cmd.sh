@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Copyright 2026 Yue Zhang
+# SPDX-License-Identifier: Apache-2.0
 # Send a command to the running PX4 SITL from any terminal (same as typing it at pxh>).
 # 从任意终端向正在运行的 PX4 SITL 发送命令，效果等同于在 pxh> 中输入。
 #

@@ -115,7 +115,8 @@ def _debris(rng, x0, x1, y, z, state):
         while x < x1 - 0.3:
             ln = min(rng.uniform(0.5, 0.9), x1 - 0.1 - x)
             h = rng.uniform(0.26, 0.36)
-            parts.append((x + ln / 2, ln, h, rng.choice(browns + greens), rng.uniform(-0.15, 0.15)))
+            parts.append((x + ln / 2, ln, h, rng.choice(browns + greens),
+                          rng.uniform(-0.15, 0.15)))
             x += ln + rng.uniform(0.0, 0.1)
     return [(xc, y, z + h / 2, ln, 0.14, h, col, yw) for xc, ln, h, col, yw in parts]
 
@@ -146,13 +147,15 @@ def build(cfg: dict, name: str):
             v += _box(f'gable_{sx}_{i}', (sx * (hl - 0.05), 0, z0 + dz / 2, 0, 0, 0),
                       (0.1, max(w, 0.1), dz), wall)
 
-    truth = {'name': name, 'house': {
-        'center': list(h.center), 'length': h.length, 'depth': h.depth,
-        'ridge_bearing_deg': h.bearing, 'wall_height': h.wall_h,
-        'eave_height': round(h.eave_h, 3), 'ridge_height': round(h.ridge_h, 3),
-        'overhang': h.over,
-        'footprint_with_overhang': [h.to_ne(sx * (hl + h.over), sy * (hd + h.over))
-                                    for sx, sy in ((1, 1), (-1, 1), (-1, -1), (1, -1))]},
+    truth = {
+        'name': name,
+        'house': {
+            'center': list(h.center), 'length': h.length, 'depth': h.depth,
+            'ridge_bearing_deg': h.bearing, 'wall_height': h.wall_h,
+            'eave_height': round(h.eave_h, 3), 'ridge_height': round(h.ridge_h, 3),
+            'overhang': h.over,
+            'footprint_with_overhang': [h.to_ne(sx * (hl + h.over), sy * (hd + h.over))
+                                        for sx, sy in ((1, 1), (-1, 1), (-1, -1), (1, -1))]},
         'gutters': []}
 
     gutter_cfg = cfg.get('gutters', {})

@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Copyright 2026 Yue Zhang
+# SPDX-License-Identifier: Apache-2.0
 # Step 5: Python packages for the mission layer (Claude API client).
 # 第 5 步：任务层用到的 Python 包（Claude API 客户端）。
 #

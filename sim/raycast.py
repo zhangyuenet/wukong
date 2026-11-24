@@ -17,7 +17,7 @@ import argparse
 import math
 import re
 import sys
-from typing import List, Tuple
+from typing import List
 import xml.etree.ElementTree as ET
 
 import numpy as np

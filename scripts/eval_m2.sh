@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Copyright 2026 Yue Zhang
+# SPDX-License-Identifier: Apache-2.0
 # Run the M2 gutter inspection on several scenarios and score each report.
 # 在多个场景上运行 M2 水槽检查，逐个给报告打分。
 #

@@ -27,7 +27,7 @@ sys.path.insert(0, HERE)
 import raycast  # noqa: E402
 
 from wukong_perception.geometry import depth_to_points, intrinsics_from_fov  # noqa: E402
-from wukong_perception.heightmap import (buildings, edge_cells, eave_lines,  # noqa: E402
+from wukong_perception.heightmap import (buildings, eave_lines, edge_cells,  # noqa: E402
                                          HeightMap)
 
 K = intrinsics_from_fov(640, 480, raycast.DEPTH_HFOV)
@@ -92,7 +92,8 @@ def compare(eaves, truth_gutters):
         k, overlap, L, dist, lo, hi, e = best
         used.add(k)
         rows.append((g['name'], 'found',
-                     f'{e.name}: covers {overlap / L:4.0%}, ends off by {-lo:+.2f}/{hi - L:+.2f} m, '
+                     f'{e.name}: covers {overlap / L:4.0%}, '
+                     f'ends off by {-lo:+.2f}/{hi - L:+.2f} m, '
                      f'{dist:.2f} m from the line, height {e.height - g["height"]:+.2f} m'))
     extra = [e for k, e in enumerate(eaves) if k not in used]
     return rows, extra
@@ -173,8 +174,8 @@ def _plot(hm, target, cells, eaves, truth_gutters, path):
     s = 4
     top = np.nan_to_num(hm.top, nan=0.0)
     g = np.clip(top / 10.0 * 200, 0, 200).astype(np.uint8)
-    img = Image.fromarray(np.flipud(g)).convert('RGB').resize((g.shape[1] * s, g.shape[0] * s),
-                                                               Image.NEAREST)
+    img = Image.fromarray(np.flipud(g)).convert('RGB').resize(
+        (g.shape[1] * s, g.shape[0] * s), Image.NEAREST)
     d = ImageDraw.Draw(img)
     rows = hm.top.shape[0]
 
@@ -199,8 +200,9 @@ def main(argv=None) -> int:
     ap.add_argument('scenarios', nargs='+')
     ap.add_argument('--png', default=None)
     args = ap.parse_args(argv)
-    ok = all([check(n, args.png) for n in args.scenarios])
-    return 0 if ok else 1
+    # Every scenario is checked, also after one fails. 一个场景失败后其余的照样检查。
+    results = [check(n, args.png) for n in args.scenarios]
+    return 0 if all(results) else 1
 
 
 if __name__ == '__main__':

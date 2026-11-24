@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Copyright 2026 Yue Zhang
+# SPDX-License-Identifier: Apache-2.0
 # Step 4: set up the ROS 2 workspace (this repository is the colcon workspace).
 # 第 4 步：准备 ROS 2 工作空间（本仓库本身就是 colcon 工作空间）。
 set -euo pipefail

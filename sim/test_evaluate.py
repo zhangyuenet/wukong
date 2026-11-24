@@ -10,10 +10,9 @@ import json
 import os
 import sys
 
-import pytest
-
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import evaluate  # noqa: E402
+import pytest  # noqa: E402
 
 # Two homes of a row, gutters along north 10.5; the neighbour's has debris.
 # 联排中的两户，水槽在北 10.5 一线；邻居家的有杂物。

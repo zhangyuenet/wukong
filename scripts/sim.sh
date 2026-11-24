@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Copyright 2026 Yue Zhang
+# SPDX-License-Identifier: Apache-2.0
 # Start the simulation with one command: XRCE-DDS Agent + PX4 SITL + Gazebo.
 # 一条命令启动仿真：XRCE-DDS Agent + PX4 SITL + Gazebo。
 #

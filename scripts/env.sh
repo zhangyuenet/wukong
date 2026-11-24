@@ -1,3 +1,5 @@
+# Copyright 2026 Yue Zhang
+# SPDX-License-Identifier: Apache-2.0
 # Wukong development environment. Source this file; do not execute it.
 # Wukong 开发环境变量。用 source 加载，不要直接执行。
 

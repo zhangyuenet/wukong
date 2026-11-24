@@ -18,8 +18,6 @@ planned are compared with the ground truth.
 import argparse
 import json
 import math
-
-import numpy as np
 import os
 import sys
 import tempfile
@@ -28,13 +26,14 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import evaluate  # noqa: E402
-import raycast  # noqa: E402
+import numpy as np  # noqa: E402
 from perception_check import compare, K  # noqa: E402
+import raycast  # noqa: E402
 
 from wukong_flight.skills import (check_plan, Decide, GoTo, ReturnHome, Scan,  # noqa: E402
                                   Takeoff, TakePhoto)
-from wukong_mission.gutter_task import GutterRequest  # noqa: E402
 from wukong_mission.classify import TruthClassifier  # noqa: E402
+from wukong_mission.gutter_task import GutterRequest  # noqa: E402
 from wukong_mission.house_task import HouseTask, OVERVIEW  # noqa: E402
 from wukong_mission.judge import FakeJudge  # noqa: E402
 from wukong_mission.world import load_world  # noqa: E402
@@ -166,7 +165,7 @@ def fly(task, plan, start, limits, tris=None):
 
 def planned_report(task):
     """
-    The planned photos as a report: each claims what the plan says is the target's.
+    Return the planned photos as a report: each claims what the plan says is the target's.
 
     For a townhouse unit that is the part between the party walls as read (the
     photos run on past them so the boundary shows; that part counts only if a
@@ -249,8 +248,10 @@ def main(argv=None) -> int:
     ap.add_argument('--no-classify', action='store_true',
                     help='skip the house-type judgement (the drone must then refuse to inspect)')
     args = ap.parse_args(argv)
-    return 0 if all([check(n, args.verbose, args.drift, args.register, not args.no_classify)
-                     for n in args.scenarios]) else 1
+    # Every scenario is checked, also after one fails. 一个场景失败后其余的照样检查。
+    results = [check(n, args.verbose, args.drift, args.register, not args.no_classify)
+               for n in args.scenarios]
+    return 0 if all(results) else 1
 
 
 if __name__ == '__main__':
