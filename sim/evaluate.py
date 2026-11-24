@@ -44,6 +44,12 @@ import json
 import math
 import os
 import sys
+from typing import List, Optional, Sequence, Tuple
+
+# A stretch of one gutter, in metres along it: (gutter, from, to). 一条水槽上的一段。
+Part = Tuple[dict, float, float]
+# north, east, height, heading, roll, pitch
+Pose = Tuple[float, float, float, float, float, float]
 
 TOLERANCE = 0.3        # m around segment ends, for debris
 LINE_DISTANCE = 1.0    # m: a claimed stretch lies along a gutter within this of its line
@@ -104,7 +110,7 @@ def _gaps(a, b, covered):
     return sorted([g for g in gaps if g[1] - g[0] > 1e-6], key=lambda g: g[0] - g[1])
 
 
-def on_line(x, g):
+def on_line(x: dict, g: dict) -> bool:
     """Whether the stretch x claims lies along gutter g (same line, same floor, same direction)."""
     if 'height' in x and abs(x['height'] - g['height']) > HEIGHT_DISTANCE:
         return False
@@ -118,7 +124,7 @@ def on_line(x, g):
     return claimed < 0.5 or abs(s1 - s0) > 0.9 * claimed
 
 
-def claimed(x, gutters):
+def claimed(x: dict, gutters: Sequence[dict]) -> List[Part]:
     """[(gutter, lo, hi)]: the stretch the report claims, on every gutter it lies along."""
     out = []
     for g in gutters:
@@ -135,7 +141,7 @@ def claimed(x, gutters):
 class TruePoses:
     """The vehicle's true poses recorded by sim/truth_pose.py, looked up by wall time."""
 
-    def __init__(self, path):
+    def __init__(self, path: str) -> None:
         rows = []
         with open(path, encoding='utf-8') as f:
             for line in f:
@@ -146,7 +152,7 @@ class TruePoses:
         self.t = [r['t'] for r in rows]
         self.rows = rows
 
-    def at(self, t):
+    def at(self, t: Optional[float]) -> Optional[Pose]:
         """(north, east, height, heading, roll, pitch) nearest to t, or None if none is close."""
         if not self.t or t is None:
             return None
@@ -169,7 +175,7 @@ def _parallel(x, g):
     return n < 1e-9 or abs(cx * gx + cy * gy) / n > 0.9
 
 
-def seen(x, gutters, pose):
+def seen(x: dict, gutters: Sequence[dict], pose: Sequence[float]) -> List[Part]:
     """
     [(gutter, lo, hi)]: what the judged part of the picture really showed.
 
@@ -222,7 +228,8 @@ def seen(x, gutters, pose):
     return out
 
 
-def evaluate(report: dict, truth: dict, poses: 'TruePoses' = None):
+def evaluate(report: dict, truth: dict, poses: Optional['TruePoses'] = None
+             ) -> Tuple[List[tuple], List[str], str]:
     """Return (rows, problems, note): one row per judged segment, and what failed."""
     rows, problems = [], []
     gutters = truth['gutters']
@@ -323,7 +330,7 @@ def _find_poses(report_path):
     return None
 
 
-def main(argv=None) -> int:
+def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
     ap.add_argument('report')
     ap.add_argument('truth')

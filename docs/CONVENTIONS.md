@@ -41,9 +41,12 @@ wukong/                   仓库本身就是 colcon 工作空间
 ## 3. Python 风格
 
 - 遵循 ROS 2 的 ament 检查：flake8（行宽 99）和 pep257。`colcon test` 会对三个功能包
-  运行它们；`sim/` 不是功能包，由 `scripts/check.sh` 用同样的规则检查。
+  运行它们；`sim/` 和 `scripts/` 不是功能包，由 `scripts/check.sh` 用同样的规则检查。
 - 多行 docstring 的摘要写在第二行（ROS 的 pep257 规则 D213）。
-- 公共函数写类型标注。
+- 公共函数写类型标注（模块级函数和公共类的方法，参数和返回值；`__init__` 可以不写
+  返回值），由 `scripts/check_annotations.py` 检查是否缺失。只为标注才需要的重依赖
+  （ROS 节点、anthropic 客户端）放在 `if TYPE_CHECKING:` 里导入，纯逻辑模块运行时
+  仍然不依赖它们。
 - 每个源文件（Python 和 shell 脚本）开头写版权和许可证，shell 脚本写在 shebang
   之后；空的 `__init__.py` 除外：
 
@@ -83,8 +86,8 @@ wukong/                   仓库本身就是 colcon 工作空间
 - 纯逻辑用 pytest 写单元测试，放在功能包的 `test/` 目录。
 - 涉及飞行行为的改动，除单元测试外，还要在仿真中实际飞一次。
 - 运行：`colcon test --packages-select <包名> && colcon test-result --verbose`
-- 提交前运行 `./scripts/check.sh`：编译三个包并运行它们的测试，再检查 `sim/` 的风格
-  并运行它的测试。全部通过才返回 0。
+- 提交前运行 `./scripts/check.sh`：编译三个包并运行它们的测试，再检查 `sim/` 和
+  `scripts/` 的风格、运行 `sim/` 的测试、检查公共函数的类型标注。全部通过才返回 0。
 
 ### 7.1 日志和测试遗留文件
 

@@ -226,7 +226,7 @@ def _run_gutters(args, world, start, out_dir, say) -> int:
     return 0 if flight_ok and mission.decisions and mission.decisions[-1][1] else 1
 
 
-def understood_with_house(understood: str, task) -> str:
+def understood_with_house(understood: str, task: GutterTask) -> str:
     """
     Return what the drone took the task to be, with what kind of house it judged it (M3).
 
@@ -241,7 +241,7 @@ def understood_with_house(understood: str, task) -> str:
     return understood
 
 
-def main(argv=None) -> int:
+def main(argv: Optional[List[str]] = None) -> int:
     args = _parse_args(remove_ros_args(sys.argv if argv is None else argv)[1:])
     out_dir = args.out or _default_out()
     os.makedirs(out_dir, exist_ok=True)

@@ -25,6 +25,7 @@ import os
 import random
 import re
 import sys
+from typing import List, Optional, Tuple
 
 import yaml
 
@@ -68,7 +69,7 @@ class House:
         self.gutter_h = self.eave_h - 0.04          # top of the gutter bottom plate
         self.gutter_len = self.length + 2 * self.over
 
-    def to_ne(self, x: float, y: float):
+    def to_ne(self, x: float, y: float) -> Tuple[float, float]:
         """Model frame (x, y) -> local (north, east)."""
         e = x * math.cos(self.yaw) - y * math.sin(self.yaw)
         n = x * math.sin(self.yaw) + y * math.cos(self.yaw)
@@ -121,7 +122,7 @@ def _debris(rng, x0, x1, y, z, state):
     return [(xc, y, z + h / 2, ln, 0.14, h, col, yw) for xc, ln, h, col, yw in parts]
 
 
-def build(cfg: dict, name: str):
+def build(cfg: dict, name: str) -> Tuple[str, dict, dict]:
     rng = random.Random(cfg.get('seed', DEFAULTS['seed']))
     h = House(cfg)
     hd, hl = h.depth / 2, h.length / 2
@@ -230,7 +231,7 @@ def world_sdf(world_name: str, model: str) -> str:
     return s.replace('    <light name="sunUTC"', model + '    <light name="sunUTC"', 1)
 
 
-def main(argv=None) -> int:
+def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
     ap.add_argument('scenario', help='scenario YAML file')
     ap.add_argument('--out', default=os.path.join(HERE, 'generated'))

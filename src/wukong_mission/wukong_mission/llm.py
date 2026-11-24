@@ -9,7 +9,12 @@ API 密钥来自环境变量 ANTHROPIC_API_KEY，或仓库根目录的 .env（�
 """
 
 import os
-from typing import Any, List, Optional, Type
+from typing import Any, List, Optional, Type, TYPE_CHECKING, TypeVar
+
+if TYPE_CHECKING:
+    import anthropic
+
+T = TypeVar('T')
 
 DEFAULT_MODEL = 'claude-opus-5-5'
 # Server-side fallback: if a safety classifier declines, the API retries the
@@ -42,7 +47,7 @@ def load_dotenv(path: Optional[str] = None) -> None:
                 os.environ[key] = value
 
 
-def make_client(timeout: float = 60.0, max_retries: int = 2):
+def make_client(timeout: float = 60.0, max_retries: int = 2) -> 'anthropic.Anthropic':
     """Return an Anthropic client; raise LlmError with a hint if there are no credentials."""
     load_dotenv()
     import anthropic   # imported here so offline runs do not need the package
@@ -52,8 +57,8 @@ def make_client(timeout: float = 60.0, max_retries: int = 2):
     return anthropic.Anthropic(timeout=timeout, max_retries=max_retries)
 
 
-def parse(client, model: str, system: str, content: List[Any], schema: Type,
-          effort: str = 'medium', max_tokens: int = 16000):
+def parse(client: 'anthropic.Anthropic', model: str, system: str, content: List[Any],
+          schema: Type[T], effort: str = 'medium', max_tokens: int = 16000) -> T:
     """
     One request with a structured answer; returns the parsed pydantic object.
 

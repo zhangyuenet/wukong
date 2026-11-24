@@ -17,7 +17,7 @@ import argparse
 import math
 import re
 import sys
-from typing import List
+from typing import List, Optional, Sequence
 import xml.etree.ElementTree as ET
 
 import numpy as np
@@ -80,7 +80,7 @@ def load_triangles(world_sdf: str, skip_debris: bool = False) -> np.ndarray:
     return np.concatenate(tris) if tris else np.zeros((0, 3, 3))
 
 
-def render_depth(tris: np.ndarray, pose, stride: int = 4,
+def render_depth(tris: np.ndarray, pose: Sequence[float], stride: int = 4,
                  width: int = DEPTH_W, height: int = DEPTH_H, hfov: float = DEPTH_HFOV,
                  far: float = DEPTH_FAR) -> np.ndarray:
     """
@@ -129,7 +129,7 @@ def render_depth(tris: np.ndarray, pose, stride: int = 4,
     return out
 
 
-def main(argv=None) -> int:
+def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
     ap.add_argument('world')
     ap.add_argument('--pose', nargs='+', type=float, default=[0, 0, 5, 0],

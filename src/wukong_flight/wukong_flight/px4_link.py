@@ -31,7 +31,7 @@ POSITION_STALE_S = 0.5
 STATUS_STALE_S = 2.0
 
 
-def px4_topic(direction: str, name: str, msg_type) -> str:
+def px4_topic(direction: str, name: str, msg_type: type) -> str:
     """
     Return e.g. /fmu/out/vehicle_status_v1.
 

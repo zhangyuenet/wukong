@@ -12,6 +12,7 @@ Ctrl+C during flight brakes and lands; a second Ctrl+C exits at once.
 """
 
 import sys
+from typing import List, Optional
 
 import rclpy
 from rclpy.node import Node
@@ -37,7 +38,7 @@ def _read_params():
     return plan, config
 
 
-def main(args=None) -> int:
+def main(args: Optional[List[str]] = None) -> int:
     # Handle SIGINT ourselves so we can still publish a land command after Ctrl+C.
     # 自己处理 Ctrl+C，这样按下后仍能发出降落指令。
     rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)

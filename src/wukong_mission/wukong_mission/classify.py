@@ -17,13 +17,19 @@ zones, paths) never depends on it. 判断结果只决定检查哪一部分，不
 
 from dataclasses import dataclass
 import math
-from typing import Literal, Optional, Sequence, Tuple
+from typing import Literal, Optional, Sequence, Tuple, TYPE_CHECKING
 
 import numpy as np
 from pydantic import BaseModel, Field
 from wukong_perception.geometry import project, RGB_X500_DEPTH
 
 from . import llm
+
+if TYPE_CHECKING:
+    import anthropic
+    from wukong_perception.heightmap import Rectangle
+
+Point = Tuple[float, float]
 
 
 class HouseKind(BaseModel):
@@ -123,8 +129,8 @@ def annotate(photo: str, front: Tuple[Tuple[float, float], Tuple[float, float]],
 class _ClassifyHouse:
     """Shared by the real classifier: annotate, ask, convert."""
 
-    def classify_house(self, photo: str, pose, front, height: float,
-                       out_dir: str) -> 'Classification':
+    def classify_house(self, photo: str, pose: Sequence[float], front: Tuple[Point, Point],
+                       height: float, out_dir: str) -> 'Classification':
         import os
         out = os.path.join(out_dir, 'house_overview_ruler.jpg')
         annotated = annotate(photo, front, height, pose, out)
@@ -135,7 +141,8 @@ class _ClassifyHouse:
 
 class ClaudeClassifier(_ClassifyHouse):
 
-    def __init__(self, model: str = llm.DEFAULT_MODEL, effort: str = 'medium', client=None):
+    def __init__(self, model: str = llm.DEFAULT_MODEL, effort: str = 'medium',
+                 client: Optional['anthropic.Anthropic'] = None) -> None:
         self.model, self.effort = model, effort
         self.client = client if client is not None else llm.make_client()
 
@@ -148,7 +155,8 @@ class ClaudeClassifier(_ClassifyHouse):
                          effort=self.effort, max_tokens=4000)
 
 
-def from_answer(ans: HouseKind, front, source: str = 'model') -> Classification:
+def from_answer(ans: HouseKind, front: Tuple[Point, Point],
+                source: str = 'model') -> Classification:
     """Turn ruler readings into the unit's ends on the ground (north, east)."""
     unit = None
     if (ans.kind == 'townhouse_row' and ans.unit_from_m is not None
@@ -165,7 +173,7 @@ def from_answer(ans: HouseKind, front, source: str = 'model') -> Classification:
                           ans.confidence, ans.notes, source)
 
 
-def front_of(rect, viewer: Tuple[float, float]):
+def front_of(rect: 'Rectangle', viewer: Point) -> Tuple[Point, Point]:
     """Return the rectangle's side facing the viewer, ends ordered left to right as seen."""
     hu, hv = rect.length / 2, rect.width / 2
     sides = [((hu, -hv), (hu, hv)), ((-hu, hv), (-hu, -hv)),
@@ -189,7 +197,7 @@ class TruthClassifier:
     仅用于仿真：离线时用场景真值代替 Claude 判断房屋类型，与 FakeJudge 的作用相同。
     """
 
-    def __init__(self, truth: dict):
+    def __init__(self, truth: dict) -> None:
         self.truth = truth
 
     @classmethod
@@ -204,7 +212,8 @@ class TruthClassifier:
             truth = json.load(f)
         return cls(truth) if 'buildings' in truth else None
 
-    def classify_house(self, photo, pose, front, height, out_dir) -> 'Classification':
+    def classify_house(self, photo: str, pose: Sequence[float], front: Tuple[Point, Point],
+                       height: float, out_dir: str) -> 'Classification':
         for b in self.truth.get('buildings', []):
             if not b['target']:
                 continue

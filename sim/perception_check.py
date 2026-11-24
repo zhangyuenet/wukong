@@ -19,6 +19,7 @@ import math
 import os
 import sys
 import time
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -26,14 +27,15 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import raycast  # noqa: E402
 
-from wukong_perception.geometry import depth_to_points, intrinsics_from_fov  # noqa: E402
+from wukong_perception.geometry import depth_to_points, Eave, intrinsics_from_fov  # noqa: E402
 from wukong_perception.heightmap import (buildings, eave_lines, edge_cells,  # noqa: E402
                                          HeightMap)
 
 K = intrinsics_from_fov(640, 480, raycast.DEPTH_HFOV)
 
 
-def survey_poses(center, radius, altitudes, stations=8):
+def survey_poses(center: Tuple[float, float], radius: float, altitudes: Sequence[float],
+                 stations: int = 8) -> List[Tuple[float, float, float, float]]:
     poses = []
     for alt in altitudes:
         for i in range(stations):
@@ -44,7 +46,7 @@ def survey_poses(center, radius, altitudes, stations=8):
     return poses
 
 
-def target_box(truth):
+def target_box(truth: dict) -> Tuple[Tuple[float, float], float, float]:
     if 'buildings' not in truth:          # M2 (v1) truth: one house
         h = truth['house']
         pts = np.array(h['footprint_with_overhang'])
@@ -71,7 +73,8 @@ def _project(p, a, b):
     return float(r @ u), float(abs(-r[0] * u[1] + r[1] * u[0])), L
 
 
-def compare(eaves, truth_gutters):
+def compare(eaves: Sequence[Eave], truth_gutters: Sequence[dict]
+            ) -> Tuple[List[Tuple[str, str, str]], List[Eave]]:
     """Match each truth gutter to the detected eave lying along it."""
     rows = []
     used = set()
@@ -99,7 +102,7 @@ def compare(eaves, truth_gutters):
     return rows, extra
 
 
-def check(name, png_dir=None):
+def check(name: str, png_dir: Optional[str] = None) -> bool:
     gen = os.path.join(HERE, 'generated', name)
     truth = json.load(open(os.path.join(gen, 'truth.json')))
     world = os.path.join(gen, f'wukong_{name}.sdf')
@@ -140,7 +143,8 @@ def check(name, png_dir=None):
     return missed == 0 and not extra
 
 
-def plan_check(hm, eaves, here_pose, truth_gutters):
+def plan_check(hm: HeightMap, eaves: Sequence[Eave], here_pose: Sequence[float],
+               truth_gutters: Sequence[dict]) -> bool:
     """Plan the inspection from the first survey station; check it like the drone would."""
     from wukong_flight.skills import check_plan, Limits, ReturnHome, TakePhoto
     from wukong_mission.inspection import plan_inspection, surfaces_from_heightmap
@@ -195,7 +199,7 @@ def _plot(hm, target, cells, eaves, truth_gutters, path):
     print(f'   plot: {path}  (green eave cells, magenta rake, blue truth, red found)')
 
 
-def main(argv=None) -> int:
+def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
     ap.add_argument('scenarios', nargs='+')
     ap.add_argument('--png', default=None)

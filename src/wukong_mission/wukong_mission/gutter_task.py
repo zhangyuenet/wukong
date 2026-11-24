@@ -19,7 +19,7 @@ import json
 import math
 import os
 import threading
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
 
 import numpy as np
 from wukong_flight.skills import Limits, ReturnHome, Skill
@@ -27,8 +27,11 @@ from wukong_perception.geometry import (fit_house, FitError, HouseEstimate, merg
                                         RGB_X500_DEPTH)
 
 from .inspection import inspection_skills, InspectionConfig, PhotoTarget, survey_skills
-from .judge import Verdict
+from .judge import Judge, Verdict
 from .world import RoughHouse, WorldMap
+
+if TYPE_CHECKING:
+    from wukong_flight.mission_node import MissionNode
 
 COMPASS_BEARING = {'north': 0, 'northeast': 45, 'east': 90, 'southeast': 135, 'south': 180,
                    'southwest': 225, 'west': 270, 'northwest': 315}
@@ -78,7 +81,7 @@ def matching_gutters(eaves: Sequence, sides: Sequence[str]) -> Optional[List[str
 Box = Tuple[int, int, int, int]
 
 
-def crop_box(target: PhotoTarget, pose: Sequence[float], size=(1920, 1080),
+def crop_box(target: PhotoTarget, pose: Sequence[float], size: Tuple[int, int] = (1920, 1080),
              margin: float = 0.08) -> Optional[Tuple[Box, Tuple[int, int]]]:
     """
     Pixel box (left, top, right, bottom) around the segment in a photo.
@@ -128,7 +131,7 @@ def _samples(target: PhotoTarget, pose, step: float = 0.05):
     return s[ok], uvd[ok, 0]
 
 
-def stretch_in_columns(target: PhotoTarget, pose, c0: float,
+def stretch_in_columns(target: PhotoTarget, pose: Sequence[float], c0: float,
                        c1: float) -> Optional[Tuple[float, float]]:
     """Part of the segment that appears between columns c0 and c1: (from, to) in metres."""
     s, u = _samples(target, pose)
@@ -138,7 +141,7 @@ def stretch_in_columns(target: PhotoTarget, pose, c0: float,
     return float(s[inside].min()), float(s[inside].max())
 
 
-def along_at_column(target: PhotoTarget, pose, c: float) -> Optional[float]:
+def along_at_column(target: PhotoTarget, pose: Sequence[float], c: float) -> Optional[float]:
     """Where along the segment (metres from its start) column c falls; None if off it."""
     s, u = _samples(target, pose)
     if len(s) < 2 or not (min(u) <= c <= max(u)):
@@ -164,7 +167,7 @@ def point_along(target: PhotoTarget, s: float) -> Tuple[float, float]:
     return (round(float(p[0]), 3), round(float(p[1]), 3))
 
 
-def column_of(p, height: float, pose) -> Optional[float]:
+def column_of(p: Sequence[float], height: float, pose: Sequence[float]) -> Optional[float]:
     """Image column of a point at the given height, None if behind the camera."""
     u, _, d = project(np.array([[p[0], p[1], height]]), RGB_X500_DEPTH, pose)[0]
     return float(u) if d > 0.5 and np.isfinite(u) else None
@@ -258,8 +261,9 @@ class GutterTask:
     """Holds the state of one gutter inspection and answers MissionNode's callbacks."""
 
     def __init__(self, world: WorldMap, request: GutterRequest, start: Tuple[float, float],
-                 out_dir: str, judge, instruction: str,
-                 cfg: InspectionConfig = InspectionConfig(), log=print) -> None:
+                 out_dir: str, judge: Judge, instruction: str,
+                 cfg: InspectionConfig = InspectionConfig(),
+                 log: Callable[[str], None] = print) -> None:
         houses = {h.name: h for h in world.rough_houses}
         if request.house not in houses:
             raise ValueError(f'no house "{request.house}" on the map '
@@ -281,7 +285,7 @@ class GutterTask:
     def plan(self) -> List[Skill]:
         return survey_skills(self.house, self.world.limits, self.start, self.cfg) + [ReturnHome()]
 
-    def attach(self, node) -> None:
+    def attach(self, node: 'MissionNode') -> None:
         """Wire the callbacks into a MissionNode (needs a ROS node for the depth topics)."""
         from wukong_perception.depth_camera import DepthCamera
         self.depth = DepthCamera(node)
@@ -291,7 +295,8 @@ class GutterTask:
 
     # -- in flight ----------------------------------------------------------------
 
-    def on_decide(self, label: str, pose) -> Tuple[Optional[list], Optional[Limits], str]:
+    def on_decide(self, label: str, pose: Sequence[float]
+                  ) -> Tuple[Optional[list], Optional[Limits], str]:
         pts = merge(self.depth.clouds) if self.depth else None
         if pts is None:
             return None, None, 'no depth scans'
@@ -321,7 +326,7 @@ class GutterTask:
         self.decide_note = f'{len(targets)} gutter segment(s) to photograph'
         return skills, limits, self.decide_note
 
-    def on_photo(self, label: str, path: str, pose) -> None:
+    def on_photo(self, label: str, path: str, pose: Sequence[float]) -> None:
         import time
         target = self.targets.get(label)
         fut = self._pool.submit(self._inspect_one, label, path, target, tuple(pose), time.time())

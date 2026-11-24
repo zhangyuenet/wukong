@@ -16,13 +16,18 @@ Both are geometry only; the plans still go through check_plan().
 
 from dataclasses import dataclass
 import math
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
 
-from wukong_flight.skills import (Decide, GoTo, Limits, RotatedBox, Scan, Skill, Takeoff,
-                                  TakePhoto)
+from wukong_flight.skills import (Decide, GoTo, HeightField, Limits, RotatedBox, Scan, Skill,
+                                  Takeoff, TakePhoto)
 from wukong_perception.geometry import Eave, HouseEstimate, segment_eave, segments_for
 
 from .world import RoughHouse
+
+if TYPE_CHECKING:
+    from wukong_perception.heightmap import HeightMap
+
+    from .pathplan import ViewConfig
 
 Point = Tuple[float, float]
 
@@ -257,8 +262,8 @@ def _extended(e: Eave, before: float, after: float) -> Eave:
                 e.height, e.side_bearing_deg)
 
 
-def runs_into_taller(e: Eave, at_end: bool, surfaces, reach: float = 1.5,
-                     inside: float = 0.3, rise: float = 1.5) -> bool:
+def runs_into_taller(e: Eave, at_end: bool, surfaces: Sequence[HeightField],
+                     reach: float = 1.5, inside: float = 0.3, rise: float = 1.5) -> bool:
     """
     Whether something much taller stands just past one end of the eave, on its roof side.
 
@@ -289,9 +294,11 @@ def runs_into_taller(e: Eave, at_end: bool, surfaces, reach: float = 1.5,
     return False
 
 
-def plan_inspection(eaves: Sequence[Eave], surfaces, here: Tuple[float, float, float],
-                    home: Point, limits: Limits, cfg: InspectionConfig = InspectionConfig(),
-                    view=None) -> Tuple[List[Skill], Dict[str, PhotoTarget], List[Skipped]]:
+def plan_inspection(eaves: Sequence[Eave], surfaces: Sequence[HeightField],
+                    here: Tuple[float, float, float], home: Point, limits: Limits,
+                    cfg: InspectionConfig = InspectionConfig(),
+                    view: Optional['ViewConfig'] = None
+                    ) -> Tuple[List[Skill], Dict[str, PhotoTarget], List[Skipped]]:
     """
     Photograph every segment of the given eaves, flying around whatever is there.
 
@@ -356,8 +363,8 @@ def plan_inspection(eaves: Sequence[Eave], surfaces, here: Tuple[float, float, f
     return skills, targets, skipped
 
 
-def surfaces_from_heightmap(hm, res: float = 0.5, min_height: float = 0.8,
-                            name: str = 'surroundings'):
+def surfaces_from_heightmap(hm: 'HeightMap', res: float = 0.5, min_height: float = 0.8,
+                            name: str = 'surroundings') -> HeightField:
     """
     Convert a perception HeightMap (numpy) to a flight-layer HeightField no-fly zone.
 
@@ -368,7 +375,6 @@ def surfaces_from_heightmap(hm, res: float = 0.5, min_height: float = 0.8,
     把感知的高度图按最大值降采样为飞行层的高度场禁飞区，高度换回飞行使用的高度坐标系。
     """
     import numpy as np
-    from wukong_flight.skills import HeightField
     k = max(1, int(round(res / hm.res)))
     top = np.nan_to_num(hm.top, nan=-np.inf)
     r, c = top.shape

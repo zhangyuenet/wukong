@@ -25,6 +25,7 @@ import signal
 import subprocess
 import sys
 import time
+from typing import List, Optional
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PX4CMD = os.path.join(ROOT, 'scripts', 'px4cmd.sh')
@@ -55,7 +56,7 @@ def sample() -> dict:
             'pitch': math.asin(max(-1.0, min(1.0, 2 * (w * y - z * x))))}
 
 
-def main(argv=None) -> int:
+def main(argv: Optional[List[str]] = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if len(argv) != 1:
         print(__doc__.split('\n\n')[1])

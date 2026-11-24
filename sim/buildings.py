@@ -19,10 +19,14 @@ z up, origin at the centre of the footprint on the ground. A block's `side` name
 import math
 import os
 import random
-from typing import List, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 STATES = ('clean', 'leaves', 'blocked')
 COMPASS = ['north', 'northeast', 'east', 'southeast', 'south', 'southwest', 'west', 'northwest']
+RGB = Tuple[float, float, float]
+Point = Tuple[float, float]
+BuildingOut = Tuple[str, List[dict], dict]   # (model SDF, gutters' truth, building info)
+
 ROOF_COLOR = (0.45, 0.15, 0.12)
 WALL_COLORS = [(0.85, 0.80, 0.70), (0.78, 0.82, 0.86), (0.86, 0.76, 0.66), (0.80, 0.84, 0.74),
                (0.88, 0.84, 0.80), (0.74, 0.70, 0.66)]
@@ -89,7 +93,8 @@ class Writer:
         c = ' '.join(f'{v:.3f}' for v in rgb) + ' 1'
         return f'<material><ambient>{c}</ambient><diffuse>{c}</diffuse></material>'
 
-    def box(self, f: Frame, x, y, z, size, rgb, collide=False, base='box', yaw_extra=0.0):
+    def box(self, f: Frame, x: float, y: float, z: float, size: Sequence[float], rgb: RGB,
+            collide: bool = False, base: str = 'box', yaw_extra: float = 0.0) -> None:
         """Box centred at (x, y, z) in frame f, aligned with it."""
         e, n, zz = f.enu(x, y, z)
         yaw = f.yaw_enu + yaw_extra
@@ -101,7 +106,8 @@ class Writer:
         if collide:
             self.parts.append(f'      <collision name="{nm}_c">{pose}{geo}</collision>\n')
 
-    def prism(self, f: Frame, poly, thickness, rgb, base='roof'):
+    def prism(self, f: Frame, poly: Sequence[Tuple[float, float, float]], thickness: float,
+              rgb: RGB, base: str = 'roof') -> None:
         """Add a planar polygon (block-frame points), extruded below its plane: closed mesh."""
         pts = [f.enu(*p) for p in poly]
         # Normal of the polygon (Newell), pointed upwards (or anywhere if vertical).
@@ -207,7 +213,7 @@ class Block:
             out.append((self.low_side, (-L2 + o, y), (L2 - o, y), self.f.bearing_of(0, sgn)))
         return out
 
-    def build(self, w: Writer, wall_rgb, details: bool = True) -> None:
+    def build(self, w: Writer, wall_rgb: RGB, details: bool = True) -> None:
         f, L, W, H, o = self.f, self.L, self.W, self.H, self.over
         L2, W2 = L / 2, W / 2
         if self.posts:
@@ -274,8 +280,9 @@ def _debris(rng, x0, x1, state):
     return out
 
 
-def add_gutter(w: Writer, rng, block_frame: Frame, start, end, height, outward_bearing,
-               states, label: str, owner: str) -> dict:
+def add_gutter(w: Writer, rng: random.Random, block_frame: Frame, start: Point, end: Point,
+               height: float, outward_bearing: float, states: Sequence[str], label: str,
+               owner: str) -> dict:
     """Gutter along an eave (block coordinates) with debris per segment; returns its truth."""
     sx, sy = start
     ex, ey = end
@@ -329,7 +336,8 @@ def _states(spec, side, default_n):
 
 # -- buildings -------------------------------------------------------------------------------
 
-def build_house(cfg: dict, idx: int, rng, mesh_dir: str, target: bool):
+def build_house(cfg: dict, idx: int, rng: random.Random, mesh_dir: str,
+                target: bool) -> BuildingOut:
     """Build a detached house: blocks placed relative to the house frame."""
     name = cfg.get('name', f'house{idx + 1}')
     hf = Frame(tuple(cfg['center']), float(cfg.get('bearing', 90)))
@@ -374,7 +382,8 @@ def build_house(cfg: dict, idx: int, rng, mesh_dir: str, target: bool):
     return w.model(name), gutters, info
 
 
-def build_row(cfg: dict, idx: int, rng, mesh_dir: str, target_unit):
+def build_row(cfg: dict, idx: int, rng: random.Random, mesh_dir: str,
+              target_unit: Optional[int]) -> BuildingOut:
     """Build a row of townhouse units under one roof (gable or hip ends)."""
     name = cfg.get('name', f'row{idx + 1}')
     n = int(cfg['units'])
@@ -477,7 +486,7 @@ def _footprint(b: Block):
             'eave_height': round(b.eave_h, 3), 'top': round(b.ridge_h, 3)}
 
 
-def build(cfg: dict, name: str, out_dir: str):
+def build(cfg: dict, name: str, out_dir: str) -> Tuple[str, dict, dict]:
     """Return (models SDF, truth dict, rough map dict) for a v2 scenario."""
     rng = random.Random(cfg.get('seed', 1))
     mesh_dir = os.path.join(out_dir, 'meshes')

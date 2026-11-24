@@ -17,7 +17,7 @@ porch) come out the same way, so multi-storey houses need no special case.
 from collections import deque
 from dataclasses import dataclass, field
 import math
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -520,7 +520,7 @@ class Rectangle:
     width: float
     bearing_deg: float
 
-    def to_uv(self, p) -> Tuple[float, float]:
+    def to_uv(self, p: Sequence[float]) -> Tuple[float, float]:
         b = math.radians(self.bearing_deg)
         dn, de = p[0] - self.center[0], p[1] - self.center[1]
         return dn * math.cos(b) + de * math.sin(b), -dn * math.sin(b) + de * math.cos(b)

@@ -26,18 +26,19 @@ from dataclasses import asdict, dataclass
 import json
 import math
 import os
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Sequence, Tuple
 
 import numpy as np
 from wukong_flight.skills import (Decide, GoTo, HeightField, Limits, ReturnHome, Scan, Skill,
                                   Takeoff, TakePhoto)
-from wukong_perception.geometry import merge
+from wukong_perception.geometry import Eave, merge
 from wukong_perception.heightmap import (building_rectangle, buildings, eave_lines, edge_cells,
                                          FreeSpace, ground_height, HeightMap, Rectangle)
 from wukong_perception.register import merge_registered, register_scans
 
 from .gutter_task import GutterRequest, GutterTask, matching_gutters
 from .inspection import InspectionConfig, plan_inspection, surfaces_from_heightmap
+from .judge import Judge
 from .pathplan import Planner, route_home
 from .world import WorldMap
 
@@ -76,15 +77,14 @@ class SurveyConfig:
     party_wall_margin: float = 1.5
 
 
-def clip_to_window(eaves, window: Rectangle, margin: float = 1.0, min_length: float = 1.0,
-                   across_margin: Optional[float] = None):
+def clip_to_window(eaves: Sequence[Eave], window: Rectangle, margin: float = 1.0,
+                   min_length: float = 1.0, across_margin: Optional[float] = None) -> List[Eave]:
     """
     Keep the parts of eaves within a townhouse survey window (along the row's long axis).
 
     Eaves across the row (end units' sides) are kept whole if inside.
     只保留扫描窗口内（沿联排长轴方向）的屋檐部分。
     """
-    from wukong_perception.geometry import Eave
     lo, hi = -window.length / 2 - margin, window.length / 2 + margin
     # An end unit's side eave lies past the unit's end by the roof overhang.
     # 端户侧面的屋檐比户界多出屋顶挑出的距离。
@@ -165,9 +165,10 @@ class HouseTask(GutterTask):
     """State of one M3 inspection; answers MissionNode's callbacks."""
 
     def __init__(self, world: WorldMap, request: GutterRequest, start: Tuple[float, float],
-                 out_dir: str, judge, instruction: str,
+                 out_dir: str, judge: Judge, instruction: str,
                  cfg: InspectionConfig = InspectionConfig(),
-                 survey: SurveyConfig = SurveyConfig(), log=print) -> None:
+                 survey: SurveyConfig = SurveyConfig(),
+                 log: Callable[[str], None] = print) -> None:
         # Not GutterTask.__init__: there is no rough house on this map.
         from concurrent.futures import ThreadPoolExecutor
         import threading
@@ -261,7 +262,8 @@ class HouseTask(GutterTask):
             return None
         return HeightMap.from_points(pts, res=0.2, ground_level=ground)
 
-    def on_decide(self, label: str, pose) -> Tuple[Optional[list], Optional[Limits], str]:
+    def on_decide(self, label: str, pose: Sequence[float]
+                  ) -> Tuple[Optional[list], Optional[Limits], str]:
         self.visited.append((pose[0], pose[1]))
         if label == DISCOVERY:
             return self._after_discovery(pose)
@@ -366,7 +368,7 @@ class HouseTask(GutterTask):
         c = r.to_ne((lo + hi) / 2, 0.0)
         return Rectangle(c, hi - lo, r.width, r.bearing_deg)
 
-    def on_photo(self, label: str, path: str, pose) -> None:
+    def on_photo(self, label: str, path: str, pose: Sequence[float]) -> None:
         if label == OVERVIEW:              # for judging the house, not a gutter photo
             self.overview = (path, pose)
             return
@@ -813,7 +815,6 @@ class HouseTask(GutterTask):
         （好让分界出现在照片里，只有照片显示分界在那里时才判断）；整排尽头（端户转角）
         与独立屋一样外延 end_margin；横跨联排的侧面水槽在目标户一端时整条保留。
         """
-        from wukong_perception.geometry import Eave
         m, extra = self.survey.party_wall_margin, self.cfg.end_margin
         across, out = [], []
 

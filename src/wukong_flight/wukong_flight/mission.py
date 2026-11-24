@@ -156,7 +156,8 @@ def waypoints_from_flat(values: Sequence[float]) -> Tuple[Tuple[float, float, fl
         for i in range(0, len(values), 3))
 
 
-def waypoint_plan(takeoff_altitude: float, waypoints, hold_time: float) -> List[Skill]:
+def waypoint_plan(takeoff_altitude: float, waypoints: Sequence[Tuple[float, float, float]],
+                  hold_time: float) -> List[Skill]:
     """Takeoff, visit each (north, east, altitude) and hover there, then land."""
     plan: List[Skill] = [Takeoff(takeoff_altitude)]
     for north, east, alt in waypoints:

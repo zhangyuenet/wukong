@@ -22,6 +22,7 @@ import os
 import sys
 import tempfile
 import time
+from typing import Callable, List, Optional, Sequence, Tuple
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -30,8 +31,8 @@ import numpy as np  # noqa: E402
 from perception_check import compare, K  # noqa: E402
 import raycast  # noqa: E402
 
-from wukong_flight.skills import (check_plan, Decide, GoTo, ReturnHome, Scan,  # noqa: E402
-                                  Takeoff, TakePhoto)
+from wukong_flight.skills import (check_plan, Decide, GoTo, Limits, ReturnHome,  # noqa: E402
+                                  Scan, Skill, Takeoff, TakePhoto)
 from wukong_mission.classify import TruthClassifier  # noqa: E402
 from wukong_mission.gutter_task import GutterRequest  # noqa: E402
 from wukong_mission.house_task import HouseTask, OVERVIEW  # noqa: E402
@@ -43,7 +44,7 @@ from wukong_perception.geometry import depth_rays, depth_to_points  # noqa: E402
 class RayCastDepth:
     """Stands in for DepthCamera: renders the generated world instead of reading ROS."""
 
-    def __init__(self, tris, drift: float = 0.0, seed: int = 0):
+    def __init__(self, tris: np.ndarray, drift: float = 0.0, seed: int = 0) -> None:
         self.tris = tris
         self.clouds, self.labels, self.poses = [], [], []
         # Position-estimate error, a random walk like GPS noise: the image is
@@ -53,7 +54,7 @@ class RayCastDepth:
         self.rng = np.random.default_rng(seed)
         self.err = np.zeros(3)
 
-    def capture(self, label, pose, done):
+    def capture(self, label: str, pose: Sequence[float], done: Callable[[bool], None]) -> None:
         depth = raycast.render_depth(self.tris, pose, stride=4)
         if self.drift:
             self.err = np.clip(self.err + self.rng.normal(0, self.drift / 3, 3),
@@ -81,7 +82,7 @@ def _seg_dist(p, a, b):
     return np.linalg.norm(p[:, None, :] - (a[None] + t[..., None] * ab[None]), axis=2)
 
 
-def mesh_distance(points, tris):
+def mesh_distance(points: np.ndarray, tris: np.ndarray) -> np.ndarray:
     """Distance from each point (P,3) to the nearest triangle of tris (T,3,3)."""
     a, b, c = tris[:, 0], tris[:, 1], tris[:, 2]
     n = np.cross(b - a, c - a)
@@ -112,7 +113,8 @@ def _too_close(a, b, tris):
     return (tuple(ned[i]), float(d[i])) if d[i] < CLEARANCE else None
 
 
-def fly(task, plan, start, limits, tris=None):
+def fly(task: HouseTask, plan: List[Skill], start: Tuple[float, float], limits: Limits,
+        tris: Optional[np.ndarray] = None) -> Tuple[List[str], List[str], int]:
     """Execute a plan with an ideal vehicle; returns (photos, problems, scans)."""
     pos = (start[0], start[1], 0.0)
     heading = 0.0
@@ -163,7 +165,7 @@ def fly(task, plan, start, limits, tris=None):
     return photos, problems, scans
 
 
-def planned_report(task):
+def planned_report(task: HouseTask) -> dict:
     """
     Return the planned photos as a report: each claims what the plan says is the target's.
 
@@ -186,11 +188,12 @@ def planned_report(task):
     return {'flight_ok': True, 'photos': photos}
 
 
-def task_ground(task):
+def task_ground(task: HouseTask) -> float:
     return getattr(task, '_ground', 0.0)
 
 
-def check(name, verbose=False, drift=0.0, register=False, classify=True):
+def check(name: str, verbose: bool = False, drift: float = 0.0, register: bool = False,
+          classify: bool = True) -> bool:
     gen = os.path.join(HERE, 'generated', name)
     truth = json.load(open(os.path.join(gen, 'truth.json')))
     world = load_world(os.path.join(gen, 'map.yaml'))
@@ -237,7 +240,7 @@ def check(name, verbose=False, drift=0.0, register=False, classify=True):
     return good
 
 
-def main(argv=None) -> int:
+def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
     ap.add_argument('scenarios', nargs='+')
     ap.add_argument('-v', '--verbose', action='store_true')

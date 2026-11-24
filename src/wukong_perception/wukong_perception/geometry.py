@@ -115,7 +115,8 @@ def project(points: np.ndarray, k: Intrinsics, pose: Sequence[float],
 
 def depth_rays(depth: np.ndarray, k: Intrinsics, pose: Sequence[float],
                offset_frd: Tuple[float, float, float] = CAMERA_OFFSET_FRD,
-               stride: int = 4, max_range: float = 18.5):
+               stride: int = 4, max_range: float = 18.5
+               ) -> Tuple[Tuple[float, float, float], np.ndarray, np.ndarray]:
     """
     Return the camera position and every sampled ray of a depth image.
 

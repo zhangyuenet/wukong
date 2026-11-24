@@ -11,11 +11,14 @@ judgement never touches the flight. It only changes the report.
 import base64
 from dataclasses import dataclass, field
 import io
-from typing import Literal, Optional, Tuple
+from typing import Literal, Optional, Protocol, Tuple, TYPE_CHECKING
 
 from pydantic import BaseModel, Field
 
 from . import llm
+
+if TYPE_CHECKING:
+    import anthropic
 
 
 class PhotoVerdict(BaseModel):
@@ -95,10 +98,20 @@ def _jpeg_b64(path: str) -> str:
     return base64.standard_b64encode(buf.getvalue()).decode('ascii')
 
 
+class Judge(Protocol):
+    """What a photo judge answers: ClaudeJudge in flight, FakeJudge offline."""
+
+    def judge(self, instruction: str, label: str, question: str, path: str) -> 'Verdict':
+        """Answer the question about one cropped photo."""
+
+    def find_boundary(self, path: str, home_position: float) -> Tuple[Optional[float], str]:
+        """Return where one home ends in a crop of the wall (0..1 across), or None, and why."""
+
+
 class ClaudeJudge:
 
     def __init__(self, model: str = llm.DEFAULT_MODEL, effort: str = 'medium',
-                 client=None) -> None:
+                 client: Optional['anthropic.Anthropic'] = None) -> None:
         self.model = model
         self.effort = effort
         self.client = client if client is not None else llm.make_client()

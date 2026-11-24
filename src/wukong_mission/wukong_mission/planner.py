@@ -14,7 +14,7 @@ before arming, so a slow or unreachable cloud can only delay the takeoff.
 from dataclasses import dataclass, field
 import json
 import math
-from typing import List, Literal, Optional, Sequence, Tuple
+from typing import List, Literal, Optional, Sequence, Tuple, TYPE_CHECKING
 
 from pydantic import BaseModel, Field
 from wukong_flight.skills import (check_plan, GoTo, Hover, Land, ReturnHome, Skill, Takeoff,
@@ -22,6 +22,11 @@ from wukong_flight.skills import (check_plan, GoTo, Hover, Land, ReturnHome, Ski
 
 from . import llm
 from .world import WorldMap
+
+if TYPE_CHECKING:
+    import anthropic
+
+    from .gutter_task import GutterRequest
 
 
 # -- what the model fills in ---------------------------------------------------
@@ -142,7 +147,7 @@ class ClaudePlanner:
     """Plans with Claude (structured output), retrying once with the check's errors."""
 
     def __init__(self, world: WorldMap, model: str = llm.DEFAULT_MODEL,
-                 effort: str = 'medium', client=None) -> None:
+                 effort: str = 'medium', client: Optional['anthropic.Anthropic'] = None) -> None:
         self.world = world
         self.model = model
         self.effort = effort
@@ -261,12 +266,12 @@ class GutterPlanner:
     """Claude reads the request; geometry is done in flight by code."""
 
     def __init__(self, world: WorldMap, model: str = llm.DEFAULT_MODEL,
-                 effort: str = 'low', client=None) -> None:
+                 effort: str = 'low', client: Optional['anthropic.Anthropic'] = None) -> None:
         self.world = world
         self.model, self.effort = model, effort
         self.client = client if client is not None else llm.make_client()
 
-    def request(self, instruction: str):
+    def request(self, instruction: str) -> 'GutterRequest':
         from .gutter_task import GutterRequest
         text = f'{self.world.describe()}\n\nUser request: {instruction}'
         spec: GutterTaskSpec = llm.parse(self.client, self.model, GUTTER_SYSTEM_PROMPT,
@@ -290,7 +295,7 @@ class OfflineGutterPlanner:
     def __init__(self, world: WorldMap) -> None:
         self.world = world
 
-    def request(self, instruction: str):
+    def request(self, instruction: str) -> 'GutterRequest':
         from .gutter_task import GutterRequest
         if self.world.find_house:
             return GutterRequest(f'(offline) inspect all gutters of the nearest building: '
