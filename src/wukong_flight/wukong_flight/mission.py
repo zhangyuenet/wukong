@@ -89,7 +89,20 @@ class MissionConfig:
     tolerance: float = 0.5                 # m, distance that counts as "reached"
     yaw_tolerance: float = 0.1             # rad (~6 deg)
     max_speed: float = 3.0                 # m/s, how fast the setpoint moves
-    settle_speed: float = 0.3              # m/s, must be this still to take a photo
+    settle_speed: float = 0.3              # m/s, must be this still to decide
+    # Photos: which part of a gutter photo is judged comes from the pose
+    # recorded with it, and the gutter sits only ~6 deg above the frame's
+    # bottom edge. "Arrived" (within tolerance) can still mean 1.5 m/s and 7 deg
+    # of tilt; at 0.3 m/s a photo was once taken 0.35 m high, braking after a
+    # descent, and the gutter's near end fell out of the picture. No tilt limit:
+    # wind holds a hovering drone tilted, and the recorded pose has the tilt.
+    # 拍照：水槽照片判断哪一部分要用拍照时记录的位姿来算，而水槽离画面底边只有约 6 度。
+    # “到达”（在 tolerance 以内）时速度可能还有 1.5 m/s、倾斜 7 度；原来速度低于 0.3 m/s
+    # 就拍，曾在下降后刹车、还高出 0.35 米时拍下，水槽近端出了画面。不限制倾斜：
+    # 有风时悬停本来就是斜的，记录的位姿里有倾斜角。
+    photo_tolerance: float = 0.2           # m from the viewpoint
+    photo_settle_speed: float = 0.15       # m/s
+    photo_settle_time: float = 0.5         # s, continuously that still
     photo_timeout: float = 5.0             # s, give up on one photo or scan after this
     decide_timeout: float = 30.0           # s, then go on with the plan as it is
     # Depth scans need the vehicle truly still: braking tilts it by several
@@ -538,19 +551,24 @@ class Mission:
                 out.commands.append(Command.LAND)
 
     def _settled(self, s: VehicleState, strict: bool) -> bool:
-        """Arrived and still; for scans, very still for scan_settle_time."""
+        """Close to the viewpoint and still for a moment; for scans, very still and longer."""
         cfg = self.config
-        if not strict:
-            return s.speed < cfg.settle_speed and self._arrived(s)
-        assert self._target is not None
-        still = (self._arrived(s) and s.speed < cfg.scan_settle_speed
-                 and abs(_wrap(s.heading - self._target.yaw)) < cfg.scan_yaw_tolerance)
+        t = self._target
+        assert t is not None
+        if strict:
+            still = (self._arrived(s) and s.speed < cfg.scan_settle_speed
+                     and abs(_wrap(s.heading - t.yaw)) < cfg.scan_yaw_tolerance)
+            wait = cfg.scan_settle_time
+        else:
+            still = (self._arrived(s) and s.speed < cfg.photo_settle_speed
+                     and math.dist((s.x, s.y, s.z), (t.x, t.y, t.z)) < cfg.photo_tolerance)
+            wait = cfg.photo_settle_time
         if not still:
             self._still_since = None
             return False
         if self._still_since is None:
             self._still_since = s.t
-        return s.t - self._still_since >= cfg.scan_settle_time
+        return s.t - self._still_since >= wait
 
     def _apply_decision(self, label: str, s: VehicleState, out: Output) -> None:
         """Insert the skills from decide_done() after the current one, if they pass the check."""

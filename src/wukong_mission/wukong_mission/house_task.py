@@ -738,7 +738,9 @@ class HouseTask(GutterTask):
         limits = self._limits((hf, unknown))
         cfg = self.cfg
         if unit_rect is not None:
-            cfg = dataclasses.replace(cfg, end_margin=0.0)    # _unit_eaves has done it
+            # _unit_eaves has done the ends: past a party wall is the neighbour's.
+            # 两端已由 _unit_eaves 处理：共用墙另一侧是邻居家。
+            cfg = dataclasses.replace(cfg, end_margin=0.0, wall_margin=0.0)
         skills, targets, skipped = plan_inspection(chosen, [hf], tuple(pose[:3]), self.start,
                                                    limits, cfg)
         skills.append(ReturnHome())          # ends at home already: replaces the rest

@@ -33,7 +33,7 @@ from wukong_flight.px4_link import Px4Link
 from wukong_flight.skills import describe
 
 from . import llm
-from .classify import ClaudeClassifier, TruthClassifier
+from .classify import Classification, ClaudeClassifier, TruthClassifier
 from .gutter_task import GutterTask
 from .house_task import HouseTask
 from .judge import ClaudeJudge, FakeJudge, Verdict
@@ -219,14 +219,26 @@ def _run_gutters(args, world, start, out_dir, say) -> int:
                                     extra={'gutter': t.gutter, 'segment': t.segment,
                                            'segments': t.segments, 'from': list(t.start),
                                            'to': list(t.end), 'height': t.height}))
-    understood = request.understood
-    if getattr(task, 'house', None) is not None:
-        understood += f' House: {task.house.describe()}. {task.house.notes}'
-    plan = Plan(understood, list(mission.plan))
+    plan = Plan(understood_with_house(request.understood, task), list(mission.plan))
     md = write_report(out_dir, args.instruction, plan, flight_ok, note, verdicts)
     say(f'[run_task] {summary_line(verdicts)}')
     say(f'[run_task] report: {md}')
     return 0 if flight_ok and mission.decisions and mission.decisions[-1][1] else 1
+
+
+def understood_with_house(understood: str, task) -> str:
+    """
+    Return what the drone took the task to be, with what kind of house it judged it (M3).
+
+    Only HouseTask judges the house; a single-storey map's GutterTask has a
+    RoughHouse there, which has nothing to add (it once crashed the report).
+    只有 HouseTask 判断房屋类型；单层地图的 GutterTask 那里是 RoughHouse，
+    没有可补充的（曾因此在写报告时崩溃）。
+    """
+    house = getattr(task, 'house', None)
+    if isinstance(house, Classification):
+        return f'{understood} House: {house.describe()}. {house.notes}'
+    return understood
 
 
 def main(argv=None) -> int:

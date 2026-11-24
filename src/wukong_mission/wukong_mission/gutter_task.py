@@ -84,21 +84,27 @@ def crop_box(target: PhotoTarget, pose: Sequence[float], size=(1920, 1080),
     Pixel box (left, top, right, bottom) around the segment in a photo.
 
     From the vehicle pose when the photo was taken, both segment ends at gutter
-    height (left/right), and points 0.4 m above and 0.9 m below its middle
+    height (left/right), and points 0.6 m above and 0.9 m below its middle
     (top/bottom). Also returns the segment's own columns (u0, u1) inside the
     box; the margin outside them shows the neighbours. None if the segment is
     not in front of the camera.
     用拍照时的位姿把水槽段的两端投影到图像上，求出裁剪框。
     """
     mid = ((target.start[0] + target.end[0]) / 2, (target.start[1] + target.end[1]) / 2)
-    # Top only 0.4 m above the gutter: a gutter further away (round a corner)
-    # appears higher in the picture and is mostly cut off. 上边缘只到水槽上方 0.4 米：
-    # 远处的水槽（转角后面的）在画面中更靠上，大部分会被裁掉。
+    # Top 0.6 m above the gutter. Not much more: a gutter further away (round
+    # a corner) appears higher in the picture and should be cut off (at 0.7 m,
+    # in M2, one was judged). Not less: the altitude estimate is up to ~0.45 m
+    # off the truth in Gazebo, and a vehicle lower than it believes sees the
+    # gutter higher; at 0.4 m a gutter was once 1 px above the crop.
+    # 上边缘在水槽上方 0.6 米。不能再大：远处的水槽（转角后面的）在画面中更靠上，应当
+    # 裁掉（M2 时取 0.7 米，曾判断了这样的水槽）。不能再小：Gazebo 中高度估计与真值
+    # 相差可达约 0.45 米，飞机实际比估计低时水槽在画面中更靠上；取 0.4 米时水槽曾高出
+    # 裁剪框 1 个像素。
     # Bottom 0.9 m below: a gutter measured a little too far away (a skewed
     # eave line) appears lower in the picture than predicted. 下边缘放宽到 0.9 米：
     # 位置估计偏远的水槽在画面中比预测的更低。
     pts = np.array([[*target.start, target.height], [*target.end, target.height],
-                    [*mid, target.height + 0.4], [*mid, target.height - 0.9]])
+                    [*mid, target.height + 0.6], [*mid, target.height - 0.9]])
     uvd = project(pts, RGB_X500_DEPTH, pose)
     if np.any(uvd[:, 2] <= 0.5) or not np.all(np.isfinite(uvd)):
         return None

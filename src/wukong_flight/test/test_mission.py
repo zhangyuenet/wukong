@@ -155,7 +155,44 @@ def test_photo_waits_for_settle_and_continues_after_capture():
     run(m, v, on_photo=shoot)
     assert m.phase == Phase.DONE
     assert m.photos == [('south gutter', True)]
-    assert taken[0][1] < 0.3                      # vehicle was still
+    assert taken[0][1] < MissionConfig().photo_settle_speed     # vehicle was still
+
+
+def _photo_tick(hover):
+    """
+    First tick at which the photo is asked for, or None.
+
+    hover(i) -> (metres above the setpoint, speed) is how the vehicle hangs
+    about the viewpoint at tick i. 第 i 步时飞机在视点上方多高、速度多少。
+    """
+    m = Mission([Takeoff(5), GoTo(5, 0, 5, look_at=(15, 0)), TakePhoto('x'), ReturnHome()])
+    v = FakeVehicle()
+    for i in range(400):
+        out = m.step(v.s)
+        if out.photo:
+            return i
+        v.apply(out)
+        if out.setpoint is not None and m.index >= 2:
+            up, speed = hover(i)
+            v.s = replace(v.s, z=out.setpoint.z - up, speed=speed)
+    return None
+
+
+def test_photo_waits_until_close_to_the_viewpoint():
+    # Still braking after a descent: within the 0.5 m arrival tolerance, slow,
+    # but 0.3 m high. 下降后还在刹车：在到达范围内、速度也低，但还高 0.3 米。
+    assert _photo_tick(lambda i: (0.3, 0.05)) is None
+    assert _photo_tick(lambda i: (0.3 if i < 200 else 0.1, 0.05)) is not None
+
+
+def test_photo_waits_until_still_for_a_moment():
+    cfg = MissionConfig()
+    assert _photo_tick(lambda i: (0.0, 0.25)) is None            # slow, but not still
+    tick = _photo_tick(lambda i: (0.0, 0.25 if i < 200 else 0.05))
+    assert tick is not None and (tick - 200) * DT >= cfg.photo_settle_time - DT
+    # A moment of movement starts the wait again. 中途动一下，重新计时。
+    again = _photo_tick(lambda i: (0.0, 0.25 if i < 200 or i == 205 else 0.05))
+    assert again is not None and again > tick
 
 
 def _first_photo_tick(steady, heading_error, until=None):

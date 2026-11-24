@@ -46,6 +46,15 @@ class InspectionConfig:
     # debris collects. 每条屋檐两端多拍这么远：测得的屋檐在山墙端会短一点，
     # 而水槽两端（落水管旁）正是最容易积杂物的地方。
     end_margin: float = 0.3
+    # ...and this far where the eave runs into a taller part of the building (a
+    # garage roof against the house wall). There, scans that do not line up
+    # spread the taller wall over the lower roof and the measured eave stops
+    # short by about their misalignment (under 0.1 m without drift, 1.0-1.2 m
+    # in Gazebo). Past the real end the photo only shows the wall.
+    # 屋檐一端紧挨更高的楼体（车库屋面接主楼墙）时多拍这么远：扫描没对齐时，高墙在高度图
+    # 里会盖到低屋面上，测得的屋檐比实际短，短多少取决于没对齐的程度（无漂移时不到 0.1 米，
+    # Gazebo 中 1.0 到 1.2 米）。拍过头的部分只是墙。
+    wall_margin: float = 1.2
 
 
 @dataclass
@@ -237,15 +246,47 @@ class Skipped:
     reason: str
 
 
-def _extended(e: Eave, margin: float) -> Eave:
-    """Return the eave lengthened by margin at both ends."""
-    if margin <= 0 or e.length < 1e-6:
+def _extended(e: Eave, before: float, after: float) -> Eave:
+    """Return the eave lengthened by `before` at its start and `after` at its end."""
+    if (before <= 0 and after <= 0) or e.length < 1e-6:
         return e
     dn = (e.end[0] - e.start[0]) / e.length
     de = (e.end[1] - e.start[1]) / e.length
-    return Eave(e.name, (round(e.start[0] - dn * margin, 3), round(e.start[1] - de * margin, 3)),
-                (round(e.end[0] + dn * margin, 3), round(e.end[1] + de * margin, 3)),
+    return Eave(e.name, (round(e.start[0] - dn * before, 3), round(e.start[1] - de * before, 3)),
+                (round(e.end[0] + dn * after, 3), round(e.end[1] + de * after, 3)),
                 e.height, e.side_bearing_deg)
+
+
+def runs_into_taller(e: Eave, at_end: bool, surfaces, reach: float = 1.5,
+                     inside: float = 0.3, rise: float = 1.5) -> bool:
+    """
+    Whether something much taller stands just past one end of the eave, on its roof side.
+
+    That is a lower roof meeting a taller part of the building, where the
+    gutter runs on up to the wall. Looked for within `reach` past the end,
+    `inside` back from the eave line, at least `rise` above the eave: a roof
+    of its own rises less than that so close to its edge.
+    屋檐一端外侧（屋面一侧）紧挨着高得多的东西：低屋面接更高的楼体，水槽一直通到墙边。
+    在端点外 reach 以内、屋檐线往里 inside 处找，比屋檐高 rise 以上才算；
+    自身的屋面离边缘这么近时升不了这么高。
+    """
+    if e.length < 1e-6:
+        return False
+    sign = 1.0 if at_end else -1.0
+    dn = sign * (e.end[0] - e.start[0]) / e.length
+    de = sign * (e.end[1] - e.start[1]) / e.length
+    p0 = e.end if at_end else e.start
+    o = e.outward
+    steps = max(1, int(round(reach / 0.1)))
+    for k in range(1, steps + 1):
+        t = k * reach / steps
+        n = p0[0] + dn * t - o[0] * inside
+        east = p0[1] + de * t - o[1] * inside
+        for hf in surfaces:
+            h = hf.height_at(n, east)
+            if h is not None and h > e.height + rise:
+                return True
+    return False
 
 
 def plan_inspection(eaves: Sequence[Eave], surfaces, here: Tuple[float, float, float],
@@ -269,7 +310,10 @@ def plan_inspection(eaves: Sequence[Eave], surfaces, here: Tuple[float, float, f
     # Viewpoints for every segment first. 先为每一段选好视点。
     plans = []
     for e in eaves:
-        e = _extended(e, cfg.end_margin)
+        before, after = (max(cfg.end_margin, cfg.wall_margin)
+                         if cfg.wall_margin > 0 and runs_into_taller(e, at_end, surfaces)
+                         else cfg.end_margin for at_end in (False, True))
+        e = _extended(e, before, after)
         n = segments_for(e, cfg.segment_length)
         views = []
         for i, (a, b) in enumerate(segment_eave(e, n), 1):

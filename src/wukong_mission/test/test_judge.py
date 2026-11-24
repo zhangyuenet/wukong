@@ -95,6 +95,22 @@ def test_crop_box_covers_the_segment_from_the_viewpoint():
     assert 700 < u1 - u0 < 1000
 
 
+def test_crop_box_allows_for_the_altitude_estimate():
+    # The vehicle 0.45 m lower than it believes sees the gutter as if it were
+    # 0.45 m higher: still inside the crop. 飞机实际比估计低 0.45 米，看到的水槽
+    # 相当于高了 0.45 米，仍在裁剪框内。
+    from wukong_mission.gutter_task import crop_box
+    from wukong_mission.inspection import PhotoTarget
+    from wukong_perception.geometry import project, RGB_X500_DEPTH
+    t = PhotoTarget('s', 'south gutter', 2, 4, (10.4, -2.75), (10.4, 0.0), 2.7,
+                    (5.9, -1.375, 3.6))
+    pose = (5.9, -1.375, 3.6, 0.0, 0.0, 0.0)
+    (left, top, right, bottom), _ = crop_box(t, pose)
+    for dz in (-0.45, 0.0, 0.45):
+        _, v, _ = project([[10.4, -1.375, 2.7 + dz]], RGB_X500_DEPTH, pose)[0]
+        assert top <= v <= bottom
+
+
 def test_report_lists_segments_without_photo(tmp_path):
     extra = {'gutter': 'north gutter', 'segment': 2, 'segments': 3}
     v = [Verdict('north gutter segment 2 of 3', '', 'skipped', 'low',

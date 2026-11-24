@@ -4,9 +4,11 @@
 
 import math
 
+import pytest
+
 from wukong_flight.skills import (check_plan, GoTo, HeightField, Limits, ReturnHome, Takeoff,
                                   TakePhoto)
-from wukong_mission.inspection import plan_inspection
+from wukong_mission.inspection import InspectionConfig, plan_inspection, runs_into_taller
 from wukong_mission.pathplan import choose_viewpoint, line_of_sight, Planner
 from wukong_perception.geometry import Eave
 
@@ -70,3 +72,42 @@ def test_plan_inspection_photographs_and_comes_home():
     last = skills[-1]
     assert (last.north, last.east) == (0.0, 0.0)
     assert check_plan(skills + [ReturnHome()], LIMITS, initial=(4.0, 0.0, 6.4)).ok
+
+
+def _stretch(targets, gutter):
+    """(first, last) east coordinate photographed of a gutter running east-west."""
+    ends = [p[1] for t in targets.values() if t.gutter == gutter for p in (t.start, t.end)]
+    return min(ends), max(ends)
+
+
+def test_lower_eave_is_photographed_on_past_its_end_at_a_taller_wall():
+    # The annex's south eave, measured 1 m short of the main house's wall
+    # (east 5), as when misaligned scans spread the wall over the annex roof.
+    # 附属建筑南侧屋檐测得比主楼墙（东 5 米）短 1 米，如同扫描没对齐时高墙盖到了低屋面上。
+    annex = Eave('lower south gutter', (10.0, 6.0), (10.0, 10.0), 2.8, 180.0)
+    main = Eave('upper south gutter', (10.0, -5.0), (10.0, 5.0), 5.8, 180.0)
+    assert runs_into_taller(annex, False, [l_house()])
+    assert not runs_into_taller(annex, True, [l_house()])
+    assert not runs_into_taller(main, False, [l_house()])
+    assert not runs_into_taller(main, True, [l_house()])     # the annex is lower
+    cfg = InspectionConfig()
+    skills, targets, skipped = plan_inspection([annex, main], [l_house()], (4.0, 0.0, 6.4),
+                                               (0.0, 0.0), LIMITS, cfg)
+    assert not skipped
+    lo, hi = _stretch(targets, 'lower south gutter')
+    assert lo == pytest.approx(6.0 - cfg.wall_margin, abs=0.01)     # on up to the wall
+    assert hi == pytest.approx(10.0 + cfg.end_margin, abs=0.01)
+    lo, hi = _stretch(targets, 'upper south gutter')
+    assert (lo, hi) == pytest.approx((-5.0 - cfg.end_margin, 5.0 + cfg.end_margin), abs=0.01)
+    assert check_plan(skills + [ReturnHome()], LIMITS, initial=(4.0, 0.0, 6.4)).ok
+
+
+def test_a_rising_roof_is_not_a_taller_wall():
+    # A steep roof (45 deg) climbing from the eave, each cell as high as its
+    # top edge (max-pooled), as past an end measured short; that is no wall.
+    # 从屋檐升起的陡屋面（45 度，每格取其高边的高度，与最大值降采样一样），不是墙。
+    cells = {(i, j): 2.8 + 0.5 * (i - 19) for i in range(20, 30) for j in range(0, 20)}
+    roof = HeightField((0.0, 0.0), 0.5, cells, 'roof')
+    eave = Eave('south gutter', (10.0, 2.0), (10.0, 8.0), 2.8, 180.0)
+    assert not runs_into_taller(eave, False, [roof])
+    assert not runs_into_taller(eave, True, [roof])
