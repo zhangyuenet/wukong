@@ -24,6 +24,10 @@ class FakeVehicle:
         self.commands = []
         self.setpoints = []
         self.offboard_allowed = True
+        self.land_allowed = True       # False: PX4 refuses the land mode
+        self.drop_land = 0             # this many LAND commands get lost on the way
+        self.descent = 1.0             # m per tick in land mode
+        self.auto_disarm = True        # PX4 disarms on touchdown (COM_DISARM_LAND)
 
     def apply(self, out) -> None:
         s = self.s
@@ -35,7 +39,9 @@ class FakeVehicle:
                 s = replace(s, armed=True)
             elif c == Command.DISARM:
                 s = replace(s, armed=False)
-            elif c == Command.LAND:
+            elif c == Command.LAND and self.drop_land > 0:
+                self.drop_land -= 1
+            elif c == Command.LAND and self.land_allowed:
                 s = replace(s, offboard=False, landing=True)
         if out.setpoint is not None:
             self.setpoints.append(out.setpoint)
@@ -48,10 +54,12 @@ class FakeVehicle:
                         speed=k * d / DT)
         else:
             s = replace(s, speed=0.0)
-        if s.landing:
-            s = replace(s, z=min(0.0, s.z + 1.0))
+        if s.landing and s.armed and not s.landed:
+            s = replace(s, z=min(0.0, s.z + self.descent))
             if s.z >= 0.0:
-                s = replace(s, landed=True, armed=False, landing=False)
+                s = replace(s, landed=True)
+                if self.auto_disarm:
+                    s = replace(s, armed=False, landing=False)
         self.s = replace(s, t=s.t + DT)
 
 
@@ -249,6 +257,142 @@ def test_pilot_takeover_aborts_without_commands():
     run(m, v, on_tick=takeover)
     assert m.phase == Phase.ABORTED
     assert Command.LAND not in v.commands
+
+
+def _until(mission, vehicle, cond, max_ticks=5000):
+    """Fly until cond(mission, vehicle) holds (checked before each step)."""
+    for _ in range(max_ticks):
+        if cond(mission, vehicle):
+            return
+        vehicle.apply(mission.step(vehicle.s))
+    raise AssertionError('condition never met')
+
+
+def _keep_stepping(mission, vehicle, seconds):
+    """Step for this long whether or not the mission has finished; return all outputs."""
+    outs = []
+    for _ in range(int(round(seconds / DT))):
+        out = mission.step(vehicle.s)
+        outs.append((vehicle.s.t, out))
+        vehicle.apply(out)
+    return outs
+
+
+def _commands(outs):
+    return [c for _, o in outs for c in o.commands]
+
+
+def test_pilot_takeover_while_landing_stops_commands():
+    # Regression: after PX4 had started landing, a switch to position mode was
+    # answered with LAND every second, still 600 s later.
+    # 回归测试：PX4 开始降落后遥控切到位置模式，节点每秒重发降落，600 秒后仍在发。
+    m = Mission([Takeoff(5), GoTo(10, 0, 5), Land()])
+    v = FakeVehicle()
+    v.descent = 0.05
+    _until(m, v, lambda m, v: m.phase == Phase.LAND and v.s.landing)
+    v.apply(m.step(v.s))                          # the mission sees PX4 landing
+    v.s = replace(v.s, landing=False)             # pilot: position mode
+    outs = _keep_stepping(m, v, 600.0)
+    assert m.phase == Phase.ABORTED and 'pilot' in m.failure
+    assert _commands(outs) == []
+    assert all(o.setpoint is None for _, o in outs)
+
+
+def test_pilot_takeover_before_px4_starts_landing():
+    m = Mission([Takeoff(5), GoTo(10, 0, 5), Land()])
+    v = FakeVehicle()
+    v.land_allowed = False                        # PX4 has not switched yet
+    _until(m, v, lambda m, v: m.phase == Phase.LAND)
+    v.s = replace(v.s, offboard=False)            # pilot: position mode
+    outs = _keep_stepping(m, v, 60.0)
+    assert m.phase == Phase.ABORTED and 'pilot' in m.failure
+    assert _commands(outs) == []
+
+
+def test_px4_failsafe_mode_during_landing_is_not_overridden():
+    # Position lost: PX4 switches to its own descend mode; asking for land
+    # mode (which needs a position) would fight its failsafe.
+    # 失去定位时 PX4 切到自己的下降模式；再请求需要位置的降落模式就是和失效保护对着干。
+    m = Mission([Takeoff(5), GoTo(45, 0, 5), Land()])
+    v = FakeVehicle()
+    v.land_allowed = False
+    _until(m, v, lambda m, v: m.index == 1 and v.s.x > 10)
+    v.s = replace(v.s, position_valid=False)
+    _until(m, v, lambda m, v: m.phase == Phase.LAND)    # after contact_grace
+    v.s = replace(v.s, offboard=False)            # PX4 failsafe: descend mode
+    outs = _keep_stepping(m, v, 30.0)
+    assert m.phase == Phase.ABORTED and Command.LAND not in _commands(outs)
+
+
+def test_land_command_lost_is_repeated_while_holding():
+    m = Mission([Takeoff(5), GoTo(10, 0, 5), Land()])
+    v = FakeVehicle()
+    v.drop_land = 2
+    run(m, v)
+    assert m.phase == Phase.DONE and m.failure is None
+    assert v.commands.count(Command.LAND) == 3
+    assert (v.s.x, v.s.y) == pytest.approx((10.0, 0.0), abs=0.5)   # held, then landed
+
+
+def test_px4_refusing_to_land_is_given_up_after_confirm_timeout():
+    m = Mission([Takeoff(5), GoTo(10, 0, 5), Land()], MissionConfig(land_confirm_timeout=3.0))
+    v = FakeVehicle()
+    v.land_allowed = False
+    _until(m, v, lambda m, v: m.phase == Phase.LAND)
+    t0 = v.s.t
+    outs = _keep_stepping(m, v, 10.0)
+    assert m.phase == Phase.ABORTED and 'did not start landing' in m.failure
+    # Holds the position and keeps asking until the timeout, then nothing at all.
+    # 超时前保持位置并重发降落指令，超时后什么都不发。
+    assert all(o.setpoint is not None for t, o in outs if t - t0 < 2.5)
+    assert len(_commands([x for x in outs if x[0] - t0 < 2.5])) >= 2
+    assert all(o.setpoint is None and not o.commands for t, o in outs if t - t0 > 3.5)
+
+
+def test_silence_after_px4_started_landing_sends_nothing():
+    m = Mission([Takeoff(5), GoTo(10, 0, 5), Land()])
+    v = FakeVehicle()
+    v.descent = 0.05
+    _until(m, v, lambda m, v: m.phase == Phase.LAND and v.s.landing)
+    v.apply(m.step(v.s))                          # the mission sees PX4 landing
+    sent = []
+    for _ in range(int(5.0 / DT)):                # 5 s without messages
+        sent += m.step(VehicleState(t=v.s.t, connected=False, position_valid=False)).commands
+        v.s = replace(v.s, t=v.s.t + DT)
+    assert sent == [] and m.phase == Phase.LAND
+    run(m, v)                                     # messages again: still landing
+    assert m.phase == Phase.DONE and m.failure is None
+
+
+def test_landing_that_never_ends_is_left_to_px4():
+    m = Mission([Takeoff(5), GoTo(10, 0, 5), Land()], MissionConfig(land_timeout=5.0))
+    v = FakeVehicle()
+    v.descent = 0.0                               # stuck in land mode
+    run(m, v)
+    assert m.phase == Phase.ABORTED and 'still landing' in m.failure
+    assert v.commands.count(Command.LAND) == 1
+
+
+def test_mode_change_after_touchdown_counts_as_landed():
+    m = Mission([Takeoff(5), Land()])
+    v = FakeVehicle()
+    v.auto_disarm = False
+    _until(m, v, lambda m, v: m.phase == Phase.LAND and v.s.landing and v.s.landed)
+    v.s = replace(v.s, landing=False)             # pilot: position mode, to disarm by hand
+    outs = _keep_stepping(m, v, 5.0)
+    assert m.phase == Phase.DONE and m.failure is None
+    assert _commands(outs) == []
+
+
+def test_disarm_in_the_air_while_landing_stops():
+    m = Mission([Takeoff(5), Land()])
+    v = FakeVehicle()
+    v.descent = 0.05
+    _until(m, v, lambda m, v: m.phase == Phase.LAND and v.s.landing)
+    v.s = replace(v.s, armed=False, landing=False)    # kill switch
+    outs = _keep_stepping(m, v, 5.0)
+    assert m.phase == Phase.ABORTED and 'disarmed' in m.failure
+    assert _commands(outs) == []
 
 
 def test_lost_position_lands():

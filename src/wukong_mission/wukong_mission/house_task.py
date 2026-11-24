@@ -67,6 +67,13 @@ class SurveyConfig:
     row_extension: float = 15.0         # m; a row may go on this far past what is seen
     visit_radius: float = 3.0           # m around where the drone has been: known free
     max_stations: int = 40
+    # Photograph this far past a party wall read from the overview photo, so
+    # that the boundary between the homes shows in the picture (in Gazebo the
+    # reading was up to 1.1 m off; 1.0 m missed one). The part past it is judged
+    # only if the photo shows the boundary further out. 在读出的共用墙外多拍这么远，
+    # 好让两户的分界出现在照片里（Gazebo 中读数最多差 1.1 米，1.0 米时漏过一次）；
+    # 这部分只有照片显示分界更靠外时才判断。
+    party_wall_margin: float = 1.5
 
 
 def clip_to_window(eaves, window: Rectangle, margin: float = 1.0, min_length: float = 1.0,
@@ -109,20 +116,11 @@ def clip_to_window(eaves, window: Rectangle, margin: float = 1.0, min_length: fl
     return out
 
 
-def _extend_away_from(e, unit: Rectangle, margin: float, near: float = 0.6):
-    """Lengthen an eave by margin at each end that is not at the unit's ends (party walls)."""
-    from wukong_perception.geometry import Eave
-    if e.length < 1e-6:
-        return e
-    lo, hi = -unit.length / 2, unit.length / 2
-    d = ((e.end[0] - e.start[0]) / e.length, (e.end[1] - e.start[1]) / e.length)
-    ends = []
-    for p, sign in ((e.start, -1.0), (e.end, 1.0)):
-        u, _ = unit.to_uv(p)
-        at_wall = abs(u - lo) < near or abs(u - hi) < near
-        k = 0.0 if at_wall else margin
-        ends.append((round(p[0] + sign * d[0] * k, 3), round(p[1] + sign * d[1] * k, 3)))
-    return Eave(e.name, ends[0], ends[1], e.height, e.side_bearing_deg)
+def _long_axis(r: Rectangle) -> Rectangle:
+    """Return the same rectangle with u along its longer side (a row's long axis)."""
+    if r.width > r.length:
+        return Rectangle(r.center, r.width, r.length, (r.bearing_deg + 90) % 360)
+    return r
 
 
 def _dilate_mask(mask: np.ndarray, k: int) -> np.ndarray:
@@ -198,6 +196,8 @@ class HouseTask(GutterTask):
         self.overview: Optional[Tuple[str, tuple]] = None   # (photo path, pose)
         self.house = None                                    # Classification
         self.is_row = world.townhouse
+        self.look: Optional[Tuple[float, float]] = None     # where the overview photo looked
+        self.refusal: Optional[str] = None                   # why nothing was inspected
         self.free = FreeSpace(start)                         # where rays went unhindered
         self._rays_added = 0
         self.building_top = 0.0
@@ -268,7 +268,9 @@ class HouseTask(GutterTask):
         if label == SURVEY_STEP:
             return self._survey_step(pose)
         if label == CLASSIFY:
-            self._classify()
+            why = self._classify()
+            if why:
+                return self._refuse(why)
             return self._survey_step(pose)
         return None, None, f'unknown decision {label}'
 
@@ -290,11 +292,11 @@ class HouseTask(GutterTask):
         self.log(f'[house] nearest building {target.distance:.1f} m away: about '
                  f'{r.length:.0f} x {r.width:.0f} m so far, at least {target.top:.1f} m high')
         if self.classifier is None:
-            return self._next_station(pose, hm)
+            return self._refuse('no way to judge what kind of house this is')
         # Face the building, take one photo, and judge what kind of house it is
         # before choosing what to survey. 正对建筑拍一张照片，先判断房屋类型再决定扫描范围。
         here = (round(pose[0], 2), round(pose[1], 2), round(pose[2], 2))
-        look = self._front_point()
+        look = self.look = self._front_point()
         # Steady: the ruler is drawn with the recorded pose. 刻度尺按记录的位姿绘制，须等稳定。
         skills = [GoTo(*here, look_at=look), TakePhoto(OVERVIEW, steady=True), Decide(CLASSIFY)]
         planner = Planner(self._survey_limits(hm))
@@ -370,12 +372,27 @@ class HouseTask(GutterTask):
             return
         super().on_photo(label, path, pose)
 
-    def _classify(self) -> None:
-        """Judge the house from the overview photo; keep the site setting if that fails."""
+    def _refuse(self, why: str):
+        """Insert nothing: the plan goes on with its checked way home, nothing inspected."""
+        self.refusal = why
+        self.decide_note = f'not inspecting: {why}'
+        self.log(f'[house] {self.decide_note}; flying home')
+        return None, None, self.decide_note
+
+    def _classify(self) -> Optional[str]:
+        """
+        Judge the house from the overview photo; return why not to inspect it, if so.
+
+        Fails closed. Without knowing the kind of house (and, in a townhouse row,
+        where the home to inspect begins and ends) the drone would inspect the
+        neighbours' gutters: a row taken for one long house, or a guessed
+        stretch of it. Then it flies home without inspecting anything.
+        不确定时不检查：不知道房屋类型、或联排中目标户的户界时，可能把联排当成一栋长房子，
+        或按猜测的范围检查到邻居家的水槽。这时直接返航，什么都不检查。
+        """
         from .classify import front_of
         if self.overview is None or self.full_rect is None:
-            self.log('[house] no overview photo; using the site setting')
-            return
+            return 'no photo of the house to judge it from'
         path, pose = self.overview
         front = self._wall_line(front_of(self.full_rect, self.start))
         # Draw the ruler 1.5 m below the camera: across the front, a little below
@@ -385,14 +402,28 @@ class HouseTask(GutterTask):
         height = pose[2] + 0.26 - 1.5
         try:
             c = self.classifier.classify_house(path, pose, front, height, self.out_dir)
-        except Exception as e:   # noqa: B902 - network, model, image: fall back, fly on
-            self.log(f'[house] could not judge the house ({e}); using the site setting')
-            return
+        except Exception as e:   # noqa: B902 - network, model, image: fly home
+            return f'could not judge what kind of house this is ({e})'
         self.house = c
-        self.is_row = c.kind == 'townhouse_row'
         self.log(f'[house] {c.describe()}: {c.notes}')
-        if self.is_row and c.unit is None:
-            self.log('[house] unit boundaries unclear: surveying around the takeoff point')
+        if c.kind == 'not_a_house':
+            return 'the nearest building does not look like a house'
+        if c.confidence == 'low':
+            return 'unsure what kind of house this is'
+        self.is_row = c.kind == 'townhouse_row'
+        if not self.is_row:
+            return None
+        if c.unit is None:
+            return 'could not tell where the home to inspect begins and ends in the row'
+        # The home read off the ruler must be the one the drone looked at.
+        # 从刻度尺上读出的那一户必须是无人机正对的那一户。
+        r = _long_axis(self.full_rect)
+        lo, hi = self._unit_range(r)
+        u = r.to_uv(self.look)[0] if self.look is not None else (lo + hi) / 2
+        if not lo - 0.3 <= u <= hi + 0.3:
+            return (f'the home read from the photo ({lo:+.1f}..{hi:+.1f} m along the row) is '
+                    f'not the one the drone looked at ({u:+.1f} m)')
+        return None
 
     def _wall_line(self, front):
         """
@@ -684,12 +715,13 @@ class HouseTask(GutterTask):
                              for e in eaves))
         with open(os.path.join(self.out_dir, 'eaves.json'), 'w', encoding='utf-8') as f:
             json.dump({'ground_level': g, 'eaves': [asdict(e) for e in eaves]}, f, indent=2)
-        if self.is_row:
-            unit_rect = self._unit_rect()
-            if unit_rect is not None:      # just the target unit's gutters 只检查目标户
-                eaves = clip_to_window(eaves, unit_rect, margin=0.8, across_margin=1.0)
-            else:
-                eaves = clip_to_window(eaves, self.rect, margin=1.0)
+        unit_rect = self._unit_rect() if self.is_row else None
+        if self.is_row and unit_rect is None:
+            return self._refuse('no unit boundaries to keep the inspection to the target home')
+        walls: List[Tuple[float, float]] = []
+        if unit_rect is not None:
+            walls = self._party_walls()
+            eaves = self._unit_eaves(eaves, unit_rect, walls)
         names = matching_gutters(eaves, self.request.sides)
         chosen = [e for e in eaves if names is None or e.name in names]
         if not chosen:
@@ -705,24 +737,126 @@ class HouseTask(GutterTask):
         unknown = self._unknown_cells(hm, hf.res)
         limits = self._limits((hf, unknown))
         cfg = self.cfg
-        unit_rect = self._unit_rect() if self.is_row else None
         if unit_rect is not None:
-            # A unit's gutters end at the party walls: photographing past them
-            # would be the neighbours'. Extend only the other ends (an end unit's
-            # outer corner). 联排户的水槽止于共用墙，再往外就是邻居家；只外延另一端
-            # （端户靠外的转角）。
-            chosen = [_extend_away_from(e, unit_rect, cfg.end_margin) for e in chosen]
-            # Ruler readings are good to about half a metre: keep a little of the
-            # neighbour's side at a party wall rather than miss our own corner.
-            # 刻度尺读数约有半米误差：宁可在共用墙处带进一点邻居家的水槽，
-            # 也不漏掉自家墙边的那一段。
-            cfg = dataclasses.replace(cfg, end_margin=0.0)
+            cfg = dataclasses.replace(cfg, end_margin=0.0)    # _unit_eaves has done it
         skills, targets, skipped = plan_inspection(chosen, [hf], tuple(pose[:3]), self.start,
                                                    limits, cfg)
         skills.append(ReturnHome())          # ends at home already: replaces the rest
+        if unit_rect is not None:
+            self._mark_home(targets, walls)
         self.targets, self.skipped = targets, skipped
         for sk in skipped:
             self.log(f'[house] skipping {sk.label}: {sk.reason}')
         self.decide_note = (f'{len(targets)} gutter segment(s) to photograph'
                             + (f', {len(skipped)} skipped' if skipped else ''))
         return skills, limits, self.decide_note
+
+    def _party_walls(self) -> List[Tuple[float, float]]:
+        """
+        Return where the party walls were read, as points on the front.
+
+        One for an end unit (its other end is the row's end), two otherwise.
+        Points, not positions along the fitted outline: carried to the back
+        along the outline, they landed 1.8 m off in Gazebo (outline 4 deg off).
+        返回读出的共用墙位置（正面上的点）。端户只有一面共用墙。用点而不是外接矩形长轴上的
+        位置：沿外接矩形搬到背面时，Gazebo 中偏了 1.8 米（矩形方向偏 4 度）。
+        """
+        r = _long_axis(self.full_rect)
+        lo, hi = self._unit_range(r)
+        a, b = sorted(self.house.unit, key=lambda p: r.to_uv(p)[0])
+        walls = []
+        if lo > -r.length / 2 + 1e-6:
+            walls.append(tuple(a))
+        if hi < r.length / 2 - 1e-6:
+            walls.append(tuple(b))
+        return walls
+
+    def _home_point(self) -> Tuple[float, float]:
+        if self.look is not None:
+            return self.look
+        return tuple(np.mean(np.array(self.house.unit, float), axis=0))
+
+    def _along_row(self, p, q) -> bool:
+        r = _long_axis(self.full_rect)
+        length = math.dist(p, q)
+        return length > 1e-6 and abs(r.to_uv(q)[0] - r.to_uv(p)[0]) >= 0.5 * length
+
+    def _span(self, p, q, walls):
+        """
+        Return (a, d, t_home, lower, upper) for the line p -> q.
+
+        Walls and the home's point are carried onto the line square to it (each
+        eave's own direction, measured, not the outline's); lower/upper are the
+        walls on either side of the home, in metres from p (+-inf: the row's end).
+        把共用墙和目标户的参考点垂直投影到这条线上（用屋檐自己的方向，而不是外接矩形的）。
+        """
+        a = np.array(p, float)
+        d = np.array(q, float) - a
+        d /= np.linalg.norm(d)
+        t_home = float((np.array(self._home_point(), float) - a) @ d)
+        tws = [float((np.array(w, float) - a) @ d) for w in walls]
+        lower = max([x for x in tws if x < t_home], default=-math.inf)
+        upper = min([x for x in tws if x > t_home], default=math.inf)
+        return a, d, t_home, lower, upper
+
+    def _unit_eaves(self, eaves, unit_rect: Rectangle, walls):
+        """
+        Keep the target home's part of each eave, and party_wall_margin past a party wall.
+
+        Ends at the row's end (an end unit's corner) get end_margin instead, as
+        every eave end does on a detached house; side gutters across the row are
+        kept whole if they are at the home's end. The part past a party wall is
+        photographed so the boundary shows; it is judged only if a photo shows
+        the boundary there. 保留每条屋檐属于目标户的部分，共用墙外多留 party_wall_margin
+        （好让分界出现在照片里，只有照片显示分界在那里时才判断）；整排尽头（端户转角）
+        与独立屋一样外延 end_margin；横跨联排的侧面水槽在目标户一端时整条保留。
+        """
+        from wukong_perception.geometry import Eave
+        m, extra = self.survey.party_wall_margin, self.cfg.end_margin
+        across, out = [], []
+
+        def eave(e, a, d, lo, hi):
+            p, q = a + d * lo, a + d * hi
+            return Eave(e.name, (round(float(p[0]), 3), round(float(p[1]), 3)),
+                        (round(float(q[0]), 3), round(float(q[1]), 3)), e.height,
+                        e.side_bearing_deg)
+        for e in eaves:
+            if e.length < 1e-6:
+                continue
+            if not self._along_row(e.start, e.end):
+                across.append(e)
+                continue
+            a, d, _, lower, upper = self._span(e.start, e.end, walls)
+            if min(upper, e.length) - max(lower, 0.0) < 0.3:
+                continue                      # not along the target home at all
+            lo = max(lower - m, 0.0) if lower > -math.inf else -extra
+            hi = min(upper + m, e.length) if upper < math.inf else e.length + extra
+            out.append(eave(e, a, d, lo, hi))
+        for e in clip_to_window(across, unit_rect, margin=m, across_margin=1.0):
+            a = np.array(e.start, float)
+            d = (np.array(e.end, float) - a) / e.length
+            out.append(eave(e, a, d, -extra, e.length + extra))
+        return out
+
+    def _mark_home(self, targets, walls) -> None:
+        """
+        Tell each photo along the row where the home is and which part is surely its.
+
+        home: the point of the gutter's line square to where the overview photo
+        looked (inside the home). claim: the part of the segment between the
+        party walls as read (or up to the row's end). 告诉每张沿联排方向的照片：
+        目标户在哪里（总览照片正对处），以及按读数确定属于目标户的那一部分。
+        """
+        for t in targets.values():
+            if not self._along_row(t.start, t.end):
+                continue                      # across the row: all of it is the home's
+            a, d, t_home, lower, upper = self._span(t.start, t.end, walls)
+            length = math.dist(t.start, t.end)
+
+            def at(s, a=a, d=d):
+                p = a + d * s
+                return (round(float(p[0]), 3), round(float(p[1]), 3))
+            t.home = at(t_home)
+            t.walls = (lower > -math.inf, upper < math.inf)
+            ca, cb = max(0.0, lower), min(length, upper)
+            t.claim = (at(ca), at(ca)) if cb <= ca else (at(ca), at(cb))

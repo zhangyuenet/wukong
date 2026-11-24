@@ -27,8 +27,9 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import evaluate  # noqa: E402
 import raycast  # noqa: E402
-from perception_check import _project, compare, K  # noqa: E402
+from perception_check import compare, K  # noqa: E402
 
 from wukong_flight.skills import (check_plan, Decide, GoTo, ReturnHome, Scan,  # noqa: E402
                                   Takeoff, TakePhoto)
@@ -163,31 +164,27 @@ def fly(task, plan, start, limits, tris=None):
     return photos, problems, scans
 
 
-def coverage(task, truth):
-    """Fraction of each truth gutter covered by planned photo segments."""
-    rows = []
-    for g in truth['gutters']:
-        # Only the stretch visible from above counts (see sim/buildings.py).
-        # 只计算从上方可见的那一段。
-        g = dict(g)
-        if 'visible' in g:
-            g['from'], g['to'] = g['visible']
-        L = math.dist(g['from'], g['to'])
-        covered = []
-        for t in task.targets.values():
-            s0, d0, _ = _project(t.start, g['from'], g['to'])
-            s1, d1, _ = _project(t.end, g['from'], g['to'])
-            if max(d0, d1) < 0.8 and abs(t.height - task_ground(task) - g['height']) < 0.8:
-                lo, hi = sorted((s0, s1))
-                covered.append((max(0.0, lo), min(L, hi)))
-        covered.sort()
-        total, end = 0.0, 0.0
-        for lo, hi in covered:
-            if hi > end:
-                total += hi - max(lo, end)
-                end = hi
-        rows.append((g, total / L if L else 0.0))
-    return rows
+def planned_report(task):
+    """
+    The planned photos as a report: each claims what the plan says is the target's.
+
+    For a townhouse unit that is the part between the party walls as read (the
+    photos run on past them so the boundary shows; that part counts only if a
+    photo shows the boundary there, which needs the real judge). Scored with
+    sim/evaluate.py's rules for gaps and intrusion; the answers mean nothing.
+    把计划拍摄的照片当成报告：每段只声明计划认定属于目标户的部分，按 evaluate.py 的
+    漏拍和越界规则检查（判断结果无意义）。
+    """
+    photos = []
+    for t in task.targets.values():
+        a, b = t.claim if t.claim is not None else (t.start, t.end)
+        if math.dist(a, b) < 0.05:
+            continue                     # wholly past a party wall: the neighbour's
+        photos.append({'needs_attention': 'no', 'findings': '',
+                       'extra': {'gutter': t.gutter, 'segment': t.segment,
+                                 'from': list(a), 'to': list(b),
+                                 'height': t.height - task_ground(task)}})
+    return {'flight_ok': True, 'photos': photos}
 
 
 def task_ground(task):
@@ -226,13 +223,12 @@ def check(name, verbose=False, drift=0.0, register=False, classify=True):
     rows, extra = compare(task.eaves, target)
     missed = [r for r in rows if r[1] == 'MISSED']
     good = not problems and not missed
-    for g, frac in coverage(task, truth):
-        tag = 'target' if g.get('target', True) else 'NOT target'
-        if g.get('target', True) and frac < 0.8:
-            good = False
-        if verbose or (g.get('target', True) and frac < 0.95) or (not g.get('target', True)
-                                                                    and frac > 0):
-            print(f'   {tag:<10} {g["name"]:<26} photographed {frac:4.0%}')
+    if getattr(task, 'refusal', None):
+        print(f'   not inspected: {task.refusal}')
+    _, scored, _ = evaluate.evaluate(planned_report(task), truth)
+    for p in scored:
+        print('  ', p)
+        good = False
     for r in missed:
         print('   MISSED eave', r[0])
     for e in extra:
@@ -251,7 +247,7 @@ def main(argv=None) -> int:
     ap.add_argument('--register', action='store_true',
                     help='align scans to each other before merging (experimental, off in flight)')
     ap.add_argument('--no-classify', action='store_true',
-                    help='skip the house-type judgement (treat the house as detached)')
+                    help='skip the house-type judgement (the drone must then refuse to inspect)')
     args = ap.parse_args(argv)
     return 0 if all([check(n, args.verbose, args.drift, args.register, not args.no_classify)
                      for n in args.scenarios]) else 1

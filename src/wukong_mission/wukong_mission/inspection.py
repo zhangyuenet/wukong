@@ -60,6 +60,19 @@ class PhotoTarget:
     end: Point
     height: float
     viewpoint: Tuple[float, float, float]
+    # One home of a townhouse row (set by HouseTask): a point on this gutter's
+    # line inside the home being inspected, and the part of the segment known
+    # to be that home's without looking (it may run past a party wall, so the
+    # boundary shows in the photo). None: the whole segment is the house's.
+    # 联排中的一户：本水槽线上位于目标户内的一点，以及不看照片就能确定属于目标户的那部分
+    # （段可能越过共用墙，好让分界出现在照片里）。None 表示整段都属于这栋房子。
+    home: Optional[Point] = None
+    claim: Optional[Tuple[Point, Point]] = None
+    # Whether a party wall bounds the home toward this segment's start and
+    # toward its end: an end unit has none toward the row's end, where a
+    # corner can look like a boundary. 目标户在本段起点方向和终点方向是否有共用墙：
+    # 端户朝整排尽头的方向没有，那里的转角可能被看成分界。
+    walls: Tuple[bool, bool] = (True, True)
 
 
 def _bearing(frm: Point, to: Point) -> float:

@@ -14,29 +14,37 @@ from .planner import Plan
 
 _ANSWER = {'yes': 'needs attention', 'no': 'OK', 'unclear': 'unclear',
            'error': 'not judged', 'pending': 'not judged (timed out)',
-           'skipped': 'not inspected'}
+           'skipped': 'not inspected', 'neighbour': "neighbour's home, not inspected"}
 
 
 def _segment_summary(verdicts: List[Verdict]) -> str:
     """Summarise per-segment results, e.g. 'Needs cleaning: south gutter segments 2, 4.'."""
     bad: dict = {}
     unknown: dict = {}
+    theirs: dict = {}
     for v in verdicts:
         g, i = v.extra['gutter'], v.extra['segment']
         if v.needs_attention == 'yes':
             bad.setdefault(g, []).append(i)
+        elif v.needs_attention == 'neighbour':
+            theirs.setdefault(g, []).append(i)
         elif v.needs_attention != 'no':
             unknown.setdefault(g, []).append(i)
 
     def fmt(d):
         return '; '.join(f'{g} segment{"s" if len(ix) > 1 else ""} '
                          + ', '.join(map(str, sorted(ix))) for g, ix in sorted(d.items()))
-    if not bad and sum(map(len, unknown.values())) == len(verdicts):
-        return f'No segment could be judged: {fmt(unknown)}.'
+    # Set aside as a neighbour's: neither judged nor a failure to judge.
+    # 判定为邻居家的段：既不是检查结果，也不算没看清。
+    left_out = f" Left out as the neighbour's: {fmt(theirs)}." if theirs else ''
+    ours = len(verdicts) - sum(map(len, theirs.values()))
+    if not bad and sum(map(len, unknown.values())) == ours:
+        return (f'No segment could be judged: {fmt(unknown)}.' if unknown
+                else 'No segment of this home was inspected.') + left_out
     parts = [f'Needs cleaning: {fmt(bad)}.' if bad else 'No gutter segment needs cleaning.']
     if unknown:
         parts.append(f'Could not tell: {fmt(unknown)}.')
-    return ' '.join(parts)
+    return ' '.join(parts) + left_out
 
 
 def summary_line(verdicts: List[Verdict]) -> str:

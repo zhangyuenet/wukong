@@ -130,3 +130,103 @@ def test_clip_to_window_keeps_only_the_middle_of_a_row():
     assert names == ['south gutter', 'east gutter']
     s = out[0]
     assert (s.start[1], s.end[1]) == pytest.approx((-6.0, 6.0))
+
+
+class _Classifier:
+    """Answers like ClaudeClassifier would, or fails like it can."""
+
+    def __init__(self, answer=None, error=None):
+        self.answer, self.error = answer, error
+
+    def classify_house(self, photo, pose, front, height, out_dir):
+        if self.error:
+            raise self.error
+        return self.answer
+
+
+def _classified(answer=None, error=None, look=(11.0, 0.0)):
+    """Return a task that has just photographed a row (east -16.25 .. +16.25) to judge it."""
+    t = HouseTask(world(), GutterRequest('x', 'nearest', []), (0.0, 0.0), '/tmp', FakeJudge(),
+                  'x')
+    t.full_rect = t.rect = Rectangle((16.0, 0.0), 32.5, 10.0, 90.0)
+    t.overview = ('/tmp/none.jpg', (5.0, 0.0, 6.0, 0.0, 0.0, 0.0))
+    t.look = look
+    t.classifier = _Classifier(answer, error)
+    return t
+
+
+def _row_answer(unit=((11.0, -3.25), (11.0, 3.25)), confidence='high', end_unit=False):
+    from wukong_mission.classify import Classification
+    return Classification('townhouse_row', 2, 'none', unit, end_unit, confidence, 'test',
+                          'model')
+
+
+@pytest.mark.parametrize('answer, error, why', [
+    (None, RuntimeError('network down'), 'could not judge'),
+    (_row_answer(unit=None), None, 'begins and ends'),
+    (_row_answer(confidence='low'), None, 'unsure'),
+    (_row_answer(unit=((11.0, 6.0), (11.0, 12.0))), None, 'not the one the drone looked at'),
+])
+def test_unsure_house_is_not_inspected(answer, error, why):
+    # Regression: a failed judgement fell back to the site setting, and a row
+    # without unit boundaries was inspected around the takeoff point: the
+    # neighbours' gutters too. 回归测试：判断失败时沿用场地设置；联排没有户界时按起飞点
+    # 附近的范围检查，把邻居家的水槽也检查了。
+    t = _classified(answer, error)
+    skills, limits, note = t.on_decide('what kind of house', (5.0, 0.0, 6.0, 0.0))
+    assert skills is None and limits is None      # the checked way home stays the plan
+    assert note.startswith('not inspecting') and why in t.refusal
+
+
+def test_clear_row_answer_goes_on_with_the_survey():
+    t = _classified(_row_answer())
+    assert t._classify() is None and t.is_row
+
+
+def test_party_walls_are_carried_square_to_each_eave():
+    # Regression: walls carried to the back along an outline 4 deg off landed
+    # 1.8 m out in Gazebo. 回归测试：沿偏了 4 度的外接矩形把户界搬到背面，偏了 1.8 米。
+    t = _classified(_row_answer())
+    t.house = _row_answer()                                    # walls at east -3.25, +3.25
+    t.full_rect = Rectangle((16.0, 0.0), 32.5, 10.0, 94.0)    # outline 4 deg off
+    front = Eave('south gutter', (11.0, -10.0), (11.0, 10.0), 5.3, 180.0)
+    back = Eave('north gutter', (21.0, 10.0), (21.0, -10.0), 5.3, 0.0)
+    out = {e.name: e for e in t._unit_eaves([front, back], t.full_rect, t._party_walls())}
+    m = t.survey.party_wall_margin
+    for name in ('south gutter', 'north gutter'):
+        ends = sorted((out[name].start[1], out[name].end[1]))
+        assert ends == pytest.approx([-3.25 - m, 3.25 + m], abs=0.01)
+
+
+def test_end_unit_corner_gets_the_end_margin_not_the_party_wall():
+    end = _row_answer(unit=((11.0, 9.75), (11.0, 16.25)), end_unit=True)
+    t = _classified(end, look=(11.0, 13.0))
+    t.house = end                                              # row ends at east +16.25
+    front = Eave('south gutter', (11.0, 5.0), (11.0, 16.25), 5.3, 180.0)
+    side = Eave('east gutter', (11.0, 16.25), (21.0, 16.25), 5.3, 90.0)    # across the row
+    walls = t._party_walls()
+    assert walls == [(11.0, 9.75)]
+    out = {e.name: e for e in t._unit_eaves([front, side], t.full_rect, walls)}
+    m, extra = t.survey.party_wall_margin, t.cfg.end_margin
+    assert out['south gutter'].start[1] == pytest.approx(9.75 - m)
+    assert out['south gutter'].end[1] == pytest.approx(16.25 + extra)
+    assert out['east gutter'].start[0] == pytest.approx(11.0 - extra)
+    assert out['east gutter'].end[0] == pytest.approx(21.0 + extra)
+
+
+def test_photos_along_a_row_know_the_home_and_their_claim():
+    from wukong_mission.inspection import PhotoTarget
+    t = _classified(_row_answer())
+    targets = {
+        'a': PhotoTarget('a', 'south gutter', 1, 3, (11.0, -4.25), (11.0, -1.4), 5.3, (6, 0, 6)),
+        'b': PhotoTarget('b', 'south gutter', 3, 3, (11.0, 1.4), (11.0, 4.25), 5.3, (6, 0, 6)),
+        'c': PhotoTarget('c', 'east gutter', 1, 1, (11.0, 16.0), (21.0, 16.0), 5.3, (6, 0, 6)),
+    }
+    t.house = _row_answer()
+    t._mark_home(targets, t._party_walls())
+    a, b, c = targets['a'], targets['b'], targets['c']
+    assert a.home == pytest.approx((11.0, 0.0)) and b.home == pytest.approx((11.0, 0.0))
+    assert [*a.claim[0], *a.claim[1]] == pytest.approx([11.0, -3.25, 11.0, -1.4])   # to wall
+    assert [*b.claim[0], *b.claim[1]] == pytest.approx([11.0, 1.4, 11.0, 3.25])
+    assert c.home is None and c.claim is None                          # across the row
+    assert a.walls == (True, True) and b.walls == (True, True)

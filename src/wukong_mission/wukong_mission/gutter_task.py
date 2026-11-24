@@ -111,6 +111,143 @@ def crop_box(target: PhotoTarget, pose: Sequence[float], size=(1920, 1080),
     return (left, top, right, bottom), (int(round(u0)) - left, int(round(u1)) - left)
 
 
+def _samples(target: PhotoTarget, pose, step: float = 0.05):
+    """(s, u): points every step along the segment (metres from its start) and their columns."""
+    a, b = np.array(target.start, float), np.array(target.end, float)
+    length = float(np.linalg.norm(b - a))
+    s = np.linspace(0.0, length, max(2, int(length / step) + 1))
+    xy = a + np.outer(s / max(length, 1e-9), b - a)
+    uvd = project(np.column_stack([xy, np.full(len(s), target.height)]), RGB_X500_DEPTH, pose)
+    ok = (uvd[:, 2] > 0.5) & np.isfinite(uvd[:, 0])
+    return s[ok], uvd[ok, 0]
+
+
+def stretch_in_columns(target: PhotoTarget, pose, c0: float,
+                       c1: float) -> Optional[Tuple[float, float]]:
+    """Part of the segment that appears between columns c0 and c1: (from, to) in metres."""
+    s, u = _samples(target, pose)
+    inside = (u >= c0 - 0.5) & (u <= c1 + 0.5)
+    if not inside.any():
+        return None
+    return float(s[inside].min()), float(s[inside].max())
+
+
+def along_at_column(target: PhotoTarget, pose, c: float) -> Optional[float]:
+    """Where along the segment (metres from its start) column c falls; None if off it."""
+    s, u = _samples(target, pose)
+    if len(s) < 2 or not (min(u) <= c <= max(u)):
+        return None
+    order = np.argsort(u)          # a straight line projects to a monotonic run of columns
+    return float(np.interp(c, u[order], s[order]))
+
+
+HOME_CLEARANCE = 0.75   # m: a boundary this close to the home's own point is in doubt
+
+
+def _along_line(target: PhotoTarget, p) -> float:
+    """Where p lies along the segment's line, in metres from its start (may be outside it)."""
+    a, b = np.array(target.start, float), np.array(target.end, float)
+    length = float(np.linalg.norm(b - a))
+    return float((np.array(p, float) - a) @ (b - a) / length) if length > 1e-9 else 0.0
+
+
+def point_along(target: PhotoTarget, s: float) -> Tuple[float, float]:
+    a, b = np.array(target.start, float), np.array(target.end, float)
+    length = float(np.linalg.norm(b - a))
+    p = a + (b - a) * (s / length if length > 1e-9 else 0.0)
+    return (round(float(p[0]), 3), round(float(p[1]), 3))
+
+
+def column_of(p, height: float, pose) -> Optional[float]:
+    """Image column of a point at the given height, None if behind the camera."""
+    u, _, d = project(np.array([[p[0], p[1], height]]), RGB_X500_DEPTH, pose)[0]
+    return float(u) if d > 0.5 and np.isfinite(u) else None
+
+
+def _wall_rows(target: PhotoTarget, pose, size) -> Tuple[int, int]:
+    """Rows from just above the gutter to 2.5 m below it: the wall shows where homes meet."""
+    mid = ((target.start[0] + target.end[0]) / 2, (target.start[1] + target.end[1]) / 2)
+    uvd = project(np.array([[*mid, target.height + 0.4], [*mid, target.height - 2.5]]),
+                  RGB_X500_DEPTH, pose)
+    top = int(max(0, min(size[1] - 1, uvd[0, 1])))
+    bottom = int(max(top + 1, min(size[1], math.ceil(uvd[1, 1]))))
+    return top, bottom
+
+
+def _save_crop(path: str, box, judged, suffix: str = '_segment.jpg') -> Optional[str]:
+    """
+    Save the box of the photo, darkening outside the judged columns (full-image columns).
+
+    The darkened strips show the neighbouring stretches for context; the judge
+    is told to ignore them. 调暗判断范围以外的部分：保留上下文，但不参与判断。
+    """
+    from PIL import Image, ImageDraw
+    try:
+        with Image.open(path) as img:
+            crop = img.convert('RGB').crop(tuple(int(v) for v in box))
+    except OSError:
+        return None
+    if judged is not None:
+        w, h = crop.size
+        u0, u1 = judged[0] - box[0], judged[1] - box[0]
+        mask = Image.new('L', crop.size, 0)
+        d = ImageDraw.Draw(mask)
+        if u0 > 1:
+            d.rectangle([0, 0, int(u0) - 1, h], fill=150)
+        if u1 < w - 1:
+            d.rectangle([int(math.ceil(u1)) + 1, 0, w, h], fill=150)
+        crop = Image.composite(Image.new('RGB', crop.size, (0, 0, 0)), crop, mask)
+    out = path[:-4] + suffix
+    crop.save(out, quality=92)
+    return out
+
+
+def apply_boundaries(verdicts: List[Verdict]) -> List[Verdict]:
+    """
+    Let a boundary between homes seen in one photo bound the others on that gutter.
+
+    A stretch lying wholly past a boundary (seen from the home being inspected)
+    is the neighbour's and is set aside; one partly past it may have been judged
+    on the neighbour's gutter, so it becomes unclear and keeps only its own part.
+    一张照片里看到的户界同样约束同一条水槽的其他照片：完全在分界之外的段属于邻居，
+    剔除；部分越过分界的段可能判断的是邻居家的水槽，改为“看不清”，只保留自家部分。
+    """
+    seen: Dict[str, List[Tuple[Tuple[float, float], str]]] = {}
+    for v in verdicts:
+        if v.extra.get('boundary'):
+            seen.setdefault(v.extra['gutter'], []).append((v.extra['boundary'], v.label))
+    for v in verdicts:
+        x = v.extra
+        if not x.get('home') or v.needs_attention in ('skipped', 'neighbour'):
+            continue
+        a, b = np.array(x['from'], float), np.array(x['to'], float)
+        length = float(np.linalg.norm(b - a))
+        if length < 1e-6:
+            continue
+        d = (b - a) / length
+        t_home = float((np.array(x['home'], float) - a) @ d)
+        lo, hi, why = 0.0, length, ''
+        for p, other in seen.get(x['gutter'], []):
+            if other == v.label:
+                continue                      # its own boundary is already applied
+            tb = float((np.array(p, float) - a) @ d)
+            if tb >= t_home and tb < hi:
+                hi, why = tb, other
+            elif tb < t_home and tb > lo:
+                lo, why = tb, other
+        if hi - lo < 0.3:
+            v.needs_attention, v.confidence = 'neighbour', 'medium'
+            v.findings = f'Past the boundary between homes seen in "{why}": the neighbour\'s.'
+        elif lo > 0.05 or hi < length - 0.05:
+            v.needs_attention, v.confidence = 'unclear', 'low'
+            v.findings += (f' Part of this stretch lies past the boundary between homes seen in '
+                           f'"{why}", so the judgement may be about the neighbour\'s gutter.')
+            p0, p1 = a + d * lo, a + d * hi
+            x['from'] = [round(float(p0[0]), 3), round(float(p0[1]), 3)]
+            x['to'] = [round(float(p1[0]), 3), round(float(p1[1]), 3)]
+    return verdicts
+
+
 class GutterTask:
     """Holds the state of one gutter inspection and answers MissionNode's callbacks."""
 
@@ -179,50 +316,131 @@ class GutterTask:
         return skills, limits, self.decide_note
 
     def on_photo(self, label: str, path: str, pose) -> None:
+        import time
         target = self.targets.get(label)
-        to_judge = path
-        if target is not None:
-            to_judge = self._crop(path, target, pose) or path
-        fut = self._pool.submit(self._judge_one, label, path, to_judge, target)
+        fut = self._pool.submit(self._inspect_one, label, path, target, tuple(pose), time.time())
         with self._lock:
             self._futures.append((label, path, fut))
 
-    def _crop(self, path: str, target: PhotoTarget, pose) -> Optional[str]:
-        from PIL import Image
-        try:
-            with Image.open(path) as img:
-                found = crop_box(target, pose, img.size)
-                if found is None:
-                    return None
-                box, (u0, u1) = found
-                crop = img.convert('RGB').crop(box)
-                # Darken the neighbours' strips. 把相邻段的部分调暗。
-                w, h = crop.size
-                dark = Image.new('RGB', crop.size, (0, 0, 0))
-                mask = Image.new('L', crop.size, 0)
-                from PIL import ImageDraw
-                d = ImageDraw.Draw(mask)
-                if u0 > 0:
-                    d.rectangle([0, 0, max(0, u0 - 1), h], fill=150)
-                if u1 < w:
-                    d.rectangle([min(w - 1, u1 + 1), 0, w, h], fill=150)
-                crop = Image.composite(dark, crop, mask)
-                out = path[:-4] + '_segment.jpg'
-                crop.save(out, quality=92)
-                return out
-        except OSError:
-            return None
+    def _inspect_one(self, label: str, path: str, target: Optional[PhotoTarget], pose,
+                     t: float) -> Verdict:
+        """
+        Crop the photo to its segment and judge it; the report says what was judged.
 
-    def _judge_one(self, label, path, to_judge, target) -> Verdict:
-        q = SEGMENT_QUESTION if target is not None else 'Does this need attention?'
-        v = self.judge.judge(self.instruction, label, q, to_judge)
+        The stretch reported ('from'/'to') is the part of the segment inside the
+        judged columns, by the recorded pose: not the plan, which may run off the
+        picture or past a party wall. A segment not in the picture at all is
+        reported as not inspected rather than judged from the whole photo.
+        报告的范围是按记录的位姿、实际落在判断区域内的那一段，不是计划的范围。
+        段完全不在画面里时报“未检查”，不再用整张照片代替。
+        """
+        if target is None:
+            v = self.judge.judge(self.instruction, label, 'Does this need attention?', path)
+            v.path = path
+            return v
+        extra = {'gutter': target.gutter, 'segment': target.segment,
+                 'segments': target.segments, 'from': list(target.start),
+                 'to': list(target.end), 'planned_from': list(target.start),
+                 'planned_to': list(target.end), 'height': target.height,
+                 'full_photo': path, 't': t, 'pose': list(pose)}
+        if target.home is not None:
+            extra['home'] = list(target.home)
+        try:
+            from PIL import Image
+            with Image.open(path) as img:
+                size = img.size
+        except OSError as e:
+            return Verdict(label, path, 'skipped', 'low', f'not inspected: no photo ({e})',
+                           extra=extra)
+        found = crop_box(target, pose, size)
+        if found is None:
+            return Verdict(label, path, 'skipped', 'low', 'not inspected: the segment is not '
+                           'in the picture (by the recorded pose)', extra=extra)
+        box, (u0, u1) = found
+        bright = (max(0.0, box[0] + u0), min(float(size[0]), box[0] + u1))
+        judged, note = bright, ''
+        if target.home is not None:
+            judged, note, boundary, status = self._home_side(path, target, pose, bright, size)
+            if boundary is not None:
+                extra['boundary'] = list(boundary)
+            if status == 'neighbour':
+                return Verdict(label, path, 'neighbour', 'medium', note, extra=extra)
+            if status == 'doubt':
+                return Verdict(label, path, 'unclear', 'low', note, extra=extra)
+        stretch = stretch_in_columns(target, pose, *judged)
+        if stretch is None:
+            return Verdict(label, path, 'skipped', 'low', 'not inspected: the segment is not '
+                           'in the judged part of the picture', extra=extra)
+        extra['from'], extra['to'] = (list(point_along(target, s)) for s in stretch)
+        extra['columns'] = [round(judged[0], 1), round(judged[1], 1)]
+        extra['rows'] = [box[1], box[3]]
+        to_judge = _save_crop(path, box, judged)
+        if to_judge is None:
+            return Verdict(label, path, 'skipped', 'low', 'not inspected: could not crop the '
+                           'photo', extra=extra)
+        v = self.judge.judge(self.instruction, label, SEGMENT_QUESTION, to_judge)
         v.path = to_judge
-        if target is not None:
-            v.extra = {'gutter': target.gutter, 'segment': target.segment,
-                       'segments': target.segments, 'from': list(target.start),
-                       'to': list(target.end), 'height': target.height,
-                       'full_photo': path}
+        v.findings = (v.findings + ' ' + note).strip()
+        v.extra = extra
         return v
+
+    def _home_side(self, path: str, target: PhotoTarget, pose, bright, size):
+        """
+        Return (columns, note, boundary, status): the inspected home's part of the strip.
+
+        Asks where one home ends in a crop showing the wall below the gutter.
+        A boundary seen: keep the home's side of it, wherever the plan put the
+        party wall. None seen: keep only the claimed part (the plan's reading of
+        the boundary). status: 'ok'; 'neighbour' (the whole strip is past the
+        boundary); 'doubt' (a boundary right at the point known to be the home's).
+        找出照片里两户的分界：看到分界就只保留目标户一侧（不论计划把共用墙放在哪里）；
+        没看到就只保留计划认定属于目标户的部分。
+        """
+        c0, c1 = bright
+        width = max(c1 - c0, 1.0)
+        u_home = column_of(target.home, target.height, pose)
+        wall = _wall_rows(target, pose, size)
+        bpath = _save_crop(path, (int(c0), wall[0], int(math.ceil(c1)), wall[1]), None,
+                           '_boundary.jpg')
+        at, why = (None, '') if bpath is None or u_home is None else \
+            self.judge.find_boundary(bpath, (u_home - c0) / width)
+        if at is not None:
+            # Toward the row's end there is no neighbour: whatever was seen there
+            # (in Gazebo, the end corner) is not a party wall. 朝整排尽头没有邻居：
+            # 在那边看到的（Gazebo 中是尽头的转角）不是共用墙。
+            s_b = along_at_column(target, pose, c0 + at * width)
+            s_home = _along_line(target, target.home)
+            if s_b is not None and not target.walls[0 if s_b < s_home else 1]:
+                at = None
+        if at is None:
+            if target.claim is None:
+                return bright, '', None, 'ok'
+            cols = [column_of(p, target.height, pose) for p in target.claim]
+            if any(c is None for c in cols):
+                return bright, '', None, 'ok'
+            lo, hi = max(c0, min(cols)), min(c1, max(cols))
+            if hi - lo < 1.0:
+                return None, ('Past the boundary between homes read from the overview photo: '
+                              "the neighbour's, not inspected."), None, 'neighbour'
+            return (lo, hi), '', None, 'ok'
+        bc = c0 + at * width
+        s_b = along_at_column(target, pose, bc)
+        boundary = point_along(target, s_b) if s_b is not None else None
+        where = f'A boundary between homes shows {at:.0%} across this stretch ({why})'
+        s_home = _along_line(target, target.home)
+        if s_b is None or abs(s_b - s_home) < HOME_CLEARANCE:
+            # At the point known to be inside the home: the reading is wrong, or
+            # the answer is. (A boundary just anywhere in a picture that also shows
+            # that point is fine: in Gazebo one was 1.1 m from it, correctly.)
+            # 分界就在已知属于目标户的那一点上：要么户界读错了，要么回答错了。
+            return None, (where + ', where the home being inspected should be: where this '
+                          'home ends is in doubt, so this stretch was not judged.'), boundary, \
+                'doubt'
+        side = (c0, bc) if u_home < bc else (bc, c1)
+        if side[1] - side[0] < 0.05 * width:
+            return None, where + ": the rest is the neighbour's, not inspected.", boundary, \
+                'neighbour'
+        return side, where + "; only this home's side of it was judged.", boundary, 'ok'
 
     # -- after landing --------------------------------------------------------------
 
@@ -243,4 +461,4 @@ class GutterTask:
                 note = 'timed out' if not fut.done() else f'failed: {e}'
                 out.append(Verdict(label, path, 'pending', 'low', f'judgement {note}'))
         self._pool.shutdown(wait=False, cancel_futures=True)
-        return out
+        return apply_boundaries(out)

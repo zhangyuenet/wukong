@@ -29,7 +29,7 @@ class Phase(enum.Enum):
     ARMING = 'arming'           # asked for offboard + arm, waiting for both
     RUNNING = 'running'         # executing plan[index]
     BRAKE = 'brake'             # stopping where we are before landing
-    LAND = 'land'               # PX4 auto-land, we only watch
+    LAND = 'land'               # ask PX4 to land until it does, then only watch
     DONE = 'done'               # landed and disarmed
     ABORTED = 'aborted'         # stopped commanding; PX4 or a pilot is in charge
 
@@ -112,6 +112,14 @@ class MissionConfig:
     # Landing without any word from PX4 for this long: stop, PX4's failsafe is in charge.
     # 降落阶段持续这么久收不到 PX4 的消息：结束任务，由 PX4 的失效保护处置。
     lost_timeout: float = 60.0             # s
+    # PX4 must switch to its land mode within this long; after that we stop
+    # asking and stop the setpoints, and PX4's offboard-loss failsafe decides.
+    # PX4 须在这段时间内进入降落模式；否则不再请求、停发设定点，由 PX4 的失效保护处置。
+    land_confirm_timeout: float = 10.0     # s
+    # Once PX4 is landing we only watch: stop watching after this long, so a
+    # landing that never ends does not hang the mission. 20 m takes about 20 s.
+    # 进入降落模式后只观察；超过这段时间仍未落地就结束任务，避免一直挂着。
+    land_timeout: float = 120.0            # s
 
     def __post_init__(self) -> None:
         if self.tolerance <= 0 or self.max_speed <= 0:
@@ -199,6 +207,7 @@ class Mission:
         self._answer: object = None
         self._land_requested = False
         self._lost_since: Optional[float] = None     # no fresh, valid vehicle state since
+        self._landing_since: Optional[float] = None  # PX4 first seen in its land mode
 
     # -- public -------------------------------------------------------------
 
@@ -457,28 +466,76 @@ class Mission:
                 self._enter(Phase.LAND, s, out, f'brake timed out at {s.speed:.1f} m/s')
 
         if self.phase == Phase.LAND:
-            if not s.connected:
-                # Without messages, armed and landed read as their defaults: they
-                # say nothing. Keep asking PX4 to land; it may still hear us.
-                # 收不到消息时“未解锁”“已落地”只是默认值，不能当真。继续发降落指令。
-                if lost_for > cfg.lost_timeout:
-                    self._abort(s, out, f'no word from PX4 for {lost_for:.0f} s while '
-                                        f'landing; PX4 failsafe in charge')
-                elif self._retry_due(s):
-                    out.commands.append(Command.LAND)
-            elif not s.armed and s.landed:
-                self._enter(Phase.DONE, s, out, 'landed and disarmed')
-            elif not s.landing and s.armed and self._retry_due(s):
-                out.commands.append(Command.LAND)
+            self._land(s, out, lost_for)
 
-        # Keep streaming setpoints in every phase where offboard is (or will be) active.
-        # 在需要 offboard 的阶段持续发送设定点，PX4 收不到会触发失效保护。
+        # Keep streaming setpoints in every phase where offboard is (or will be)
+        # active; LAND streams its own until PX4 switches (see _land).
+        # 在需要 offboard 的阶段持续发送设定点，PX4 收不到会触发失效保护；
+        # 降落阶段在 _land 里自己发送，直到 PX4 切换模式。
         if self.phase in (Phase.PRESTREAM, Phase.ARMING) + FLYING_PHASES:
             if not holding:
                 self._move_carrot(s)
             out.setpoint = self._carrot
         self._last_t = s.t
         return out
+
+    def _land(self, s: VehicleState, out: Output, lost_for: float) -> None:
+        """
+        Ask PX4 to land until it is seen landing, then only watch.
+
+        Until PX4 reports its land mode the vehicle is still ours (offboard):
+        hold the last setpoint, so the switch does not trip PX4's offboard-loss
+        failsafe, and repeat the land command. Any other mode, before or after,
+        means a pilot or a PX4 failsafe took over: stop commanding at once.
+        (Regression: a pilot switching to position mode during the landing was
+        switched back to land mode every second, indefinitely.)
+        PX4 进入降落模式之前飞机仍由我们控制：保持最后的设定点（以免切换时触发
+        offboard 丢失保护），并重发降落指令。之前或之后出现任何其他模式，都说明
+        遥控接管或 PX4 失效保护介入，立即停止发指令。（曾经在降落中遥控切到位置模式后，
+        节点每秒把模式切回降落，没有尽头。）
+        """
+        cfg = self.config
+        if not s.connected:
+            # Without messages, armed and landed read as their defaults: they
+            # say nothing. Keep asking PX4 to land, unless it already is: then
+            # a mode change we cannot see may be a pilot taking over.
+            # 收不到消息时“未解锁”“已落地”只是默认值，不能当真。PX4 尚未开始降落时继续
+            # 发降落指令；已经在降落时不再发，因为看不到的模式切换可能是遥控接管。
+            if lost_for > cfg.lost_timeout:
+                self._abort(s, out, f'no word from PX4 for {lost_for:.0f} s while '
+                                    f'landing; PX4 failsafe in charge')
+            elif self._landing_since is None and self._retry_due(s):
+                out.commands.append(Command.LAND)
+            return
+        if s.landing and self._landing_since is None:
+            self._landing_since = s.t
+            out.events.append('PX4 is landing')
+        if not s.armed:
+            if s.landed:
+                self._enter(Phase.DONE, s, out, 'landed and disarmed')
+            else:
+                self._abort(s, out, 'disarmed before touchdown, PX4 or pilot in control')
+        elif s.landing:
+            if s.t - self._landing_since > cfg.land_timeout:
+                self._abort(s, out, f'still landing after {cfg.land_timeout:.0f} s; '
+                                    f'left to PX4')
+        elif self._landing_since is not None:
+            if s.landed:
+                # A pilot often switches mode on the ground to disarm by hand.
+                # 落地后遥控切模式再手动上锁是常见操作，算正常落地。
+                self._enter(Phase.DONE, s, out, 'landed; mode changed before disarming')
+            else:
+                self._abort(s, out, 'left land mode, PX4 or pilot in control')
+        elif not s.offboard:
+            self._abort(s, out, 'left offboard mode before landing started, '
+                                'PX4 or pilot in control')
+        elif self._elapsed(s) > cfg.land_confirm_timeout:
+            self._abort(s, out, f'PX4 did not start landing within '
+                                f'{cfg.land_confirm_timeout:.0f} s; its failsafe decides')
+        else:
+            out.setpoint = self._carrot
+            if self._retry_due(s):
+                out.commands.append(Command.LAND)
 
     def _settled(self, s: VehicleState, strict: bool) -> bool:
         """Arrived and still; for scans, very still for scan_settle_time."""

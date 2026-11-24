@@ -8,8 +8,12 @@
 #
 # Each scenario gets a fresh simulation (started and stopped here), so no
 # other simulation may be running. Uses the Claude API unless OFFLINE=1:
-# about 10 requests per scenario.
-# 每个场景都重新启动仿真；运行前不能有别的仿真在运行。
+# about 10 requests per scenario (more for a townhouse unit, whose photos
+# along the row are also asked where one home ends).
+# The vehicle's true pose is recorded alongside (sim/truth_pose.py), so the
+# score checks what each photo really showed, not what the report claims.
+# 每个场景都重新启动仿真；运行前不能有别的仿真在运行。同时记录飞机的真实位姿，
+# 打分时按照片实际拍到的范围核对，而不是按报告声明的范围。
 set -eo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT/scripts/env.sh"
@@ -61,11 +65,17 @@ for sc in "${scenarios[@]}"; do
         continue
     fi
     sleep 3
+    # The truth this run is scored against, kept with it. 本次打分用的真值，与结果放在一起。
+    cp "$ROOT/sim/generated/$sc/truth.json" "$log/truth.json"
+    python3 "$ROOT/sim/truth_pose.py" "$log/truth_poses.jsonl" > "$log/truth_pose.log" 2>&1 &
+    recorder=$!
     ros2 run wukong_mission run_task "${offline[@]}" --scenario "$sc" --out "$log/mission" \
         "$INSTRUCTION" > "$log/run_task.log" 2>&1 || true
+    kill -TERM "$recorder" 2>/dev/null || true
+    wait "$recorder" 2>/dev/null || true
     grep -E '^\[run_task\] (Needs|No |Could)' "$log/run_task.log" || true
-    if python3 "$ROOT/sim/evaluate.py" "$log/mission/report.json" \
-            "$ROOT/sim/generated/$sc/truth.json" > "$log/score.txt" 2>&1; then
+    if python3 "$ROOT/sim/evaluate.py" "$log/mission/report.json" "$log/truth.json" \
+            --poses "$log/truth_poses.jsonl" > "$log/score.txt" 2>&1; then
         result[$sc]="PASS"
     else
         result[$sc]="FAIL"
