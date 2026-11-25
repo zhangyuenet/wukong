@@ -37,7 +37,9 @@ from wukong_perception.geometry import DEPTH_RANGE, Eave, merge
 from wukong_perception.heightmap import (building_rectangle, buildings, eave_lines, edge_cells,
                                          FreeSpace, ground_height, HeightMap, Rectangle)
 from wukong_perception.register import merge_registered, register_scans
+from wukong_perception.voxels import Column, VoxelMap
 
+from .explore import ExploreConfig
 from .gutter_task import GutterRequest, GutterTask, matching_gutters
 from .inspection import InspectionConfig, plan_inspection, surfaces_from_heightmap
 from .judge import Judge
@@ -58,13 +60,23 @@ class SurveyConfig:
     discovery_headings: int = 8
     # The look-around sees only DEPTH_RANGE metres. When it finds no building,
     # move on in steps the way the drone faced on the ground (the operator sets
-    # it down facing the house) and scan again, as long as nothing was seen in
-    # the way: no depth point within advance_step + advance_clearance ahead.
-    # 环视只能看到有效深度距离以内。找不到建筑时，沿起飞前机头的朝向（操作员把飞机
-    # 朝着房屋放下）逐步前进再扫描；前方 advance_step + advance_clearance 以内看到
-    # 任何深度点就不再前进。
+    # it down facing the house) and scan again. A step is taken only if what it
+    # sweeps was seen free (voxels.VoxelMap), and not if any depth point lies
+    # within the step plus advance_clearance ahead. The last step may be
+    # shorter, down to min_advance. 环视只能看到有效深度距离以内。找不到建筑时，沿起飞
+    # 前机头的朝向（操作员把飞机朝着房屋放下）逐步前进再扫描。只有这一步扫过的空间确认
+    # 为空才前进；前方在这一步加 advance_clearance 以内看到任何深度点也不前进。最后一步
+    # 可以短一些，但不短于 min_advance。
     advance_step: float = 3.0
     advance_clearance: float = 4.0
+    min_advance: float = 0.5
+    # The column above the takeoff point that the operator confirms open, from
+    # the ground to a metre above the discovery altitude: a level camera does
+    # not see beside the drone, so the first step needs this much known round it
+    # (docs/OBSTACLE_AVOIDANCE.md, section 9). 操作员确认开阔的起飞点上方竖直通道，
+    # 从地面到环视高度以上一米：水平的相机看不到机身旁边，第一步需要周围这么大的
+    # 已知空间。
+    open_column_radius: float = 3.5
     min_building_height: float = 2.5    # m; lower things (cars, fences) are not houses
     min_building_area: float = 20.0     # m^2
     low_offset: float = 7.0             # m out from the outline, low ring
@@ -219,6 +231,11 @@ class HouseTask(GutterTask):
         self.refusal: Optional[str] = None                   # why nothing was inspected
         self.free = FreeSpace(start)                         # where rays went unhindered
         self._rays_added = 0
+        # Seen free, occupied or unknown (L2); built when first needed.
+        # 三态体素地图，第一次用到时才建立。
+        self.voxels: Optional[VoxelMap] = None
+        self._voxel_rays = 0
+        self.explore = ExploreConfig()
         self.building_top = 0.0
         self.ring = 'high'             # high ring first, then low
         self.progress = 0.0            # radians travelled round the building in this ring
@@ -304,7 +321,7 @@ class HouseTask(GutterTask):
                                       min_area=s.min_building_area)
                  if b.distance <= self.world.search_radius]
         if not found:
-            self.decide_note = f'no building within {self.world.search_radius:g} m'
+            self.decide_note = self._nothing_found(pose)
             step = self._advance(pose)          # may say why it cannot move on
             if step is not None:
                 return step
@@ -334,33 +351,73 @@ class HouseTask(GutterTask):
 
         Straight on from the takeoff point the way the drone faced on the ground,
         at the discovery altitude, the depth camera facing the way it moves. Not
-        past search_radius - DEPTH_RANGE (the scans then reach search_radius), and
-        not if any depth point lies in the corridor ahead: whatever it is, the
-        drone does not fly towards it blind. 沿起飞时的朝向直线前进一步，深度相机朝前。
+        past search_radius - DEPTH_RANGE (the scans then reach search_radius);
+        not if any depth point lies in the corridor ahead (whatever it is, the
+        drone does not fly towards it blind); and only if all the step sweeps
+        was seen free. Not seeing anything in the way is not enough: a frame may
+        be missing or may not cover the way. 沿起飞时的朝向直线前进一步，深度相机朝前。
         最远到 search_radius - DEPTH_RANGE（扫描正好覆盖到搜索半径）；前方走廊里有任何
-        深度点就不前进：不管那是什么，都不盲目飞过去。
+        深度点就不前进（不管那是什么，都不盲目飞过去）；并且这一步扫过的空间必须全部确认
+        为空。只是没看到障碍不够：可能缺了一帧，或者那一帧没照到前进的路线。
         """
         s = self.survey
         u = (math.cos(self.facing), math.sin(self.facing))
         here = (pose[0], pose[1], pose[2])
-        done = (here[0] - self.start[0]) * u[0] + (here[1] - self.start[1]) * u[1]
-        reach = done + s.advance_step
-        if reach > self.world.search_radius - DEPTH_RANGE + 1e-6:
+        done = self._along(pose)
+        reach = min(done + s.advance_step, self.world.search_radius - DEPTH_RANGE)
+        if reach - done < s.min_advance:
             return None
-        ahead = self._in_the_way(here, u, s.advance_step + s.advance_clearance)
+        ahead = self._in_the_way(here, u, reach - done + s.advance_clearance)
         if ahead is not None:
-            self.decide_note = (f'no building within {DEPTH_RANGE:g} m, and something '
-                                f'{ahead:.1f} m ahead: not moving on towards it')
+            self.decide_note += f'; something {ahead:.1f} m ahead: not moving on towards it'
             return None
         nxt = (round(self.start[0] + reach * u[0], 2), round(self.start[1] + reach * u[1], 2),
                round(here[2], 2))
+        x = self.explore
+        clear = self._update_voxels().first_blocked(here, nxt, x.radius, x.half_height)
+        if clear is not None:
+            self.decide_note += (f'; the way ahead is seen free for only {clear:.1f} m of '
+                                 f'{math.dist(here, nxt):.1f}: not moving on')
+            return None
         look = (round(nxt[0] + 10 * u[0], 2), round(nxt[1] + 10 * u[1], 2))
         self.advances += 1
-        note = f'no building within {DEPTH_RANGE:g} m: moving {reach:.0f} m on to look again'
+        note = f'{self.decide_note}: moving {reach:.1f} m on to look again'
         self.decide_note = note
         skills = [GoTo(*nxt, look_at=look), Scan(f'{LOOK_AHEAD} {self.advances}'),
                   Decide(DISCOVERY), ReturnHome()]
         return skills, self.world.limits, note
+
+    def _along(self, pose: Sequence[float]) -> float:
+        """Return how far pose is from the takeoff point along the heading it had on the ground."""
+        return ((pose[0] - self.start[0]) * math.cos(self.facing)
+                + (pose[1] - self.start[1]) * math.sin(self.facing))
+
+    def _nothing_found(self, pose: Sequence[float]) -> str:
+        """Say how far discovery has looked from pose and found no building."""
+        r = self.world.search_radius
+        if DEPTH_RANGE >= r:
+            return f'no building within {r:g} m'
+        ahead = min(max(self._along(pose), 0.0) + DEPTH_RANGE, r)
+        return (f'no building within {DEPTH_RANGE:g} m all round, '
+                f'nor {ahead:.1f} m ahead on the takeoff heading')
+
+    def _update_voxels(self) -> VoxelMap:
+        """
+        Add the depth frames not yet in the voxel map, and return the map.
+
+        Made on first use, with the open column above the takeoff point
+        counted free. 第一次用到时建立，起飞点上方的开阔竖直通道算空。
+        """
+        if self.voxels is None:
+            s = self.survey
+            self.voxels = VoxelMap(self.start)
+            self.voxels.assume_free(Column(self.start, s.open_column_radius, 0.0,
+                                           s.discovery_altitude + 1.0))
+        rays = getattr(self.depth, 'rays', [])
+        for cam, ends, hit in rays[self._voxel_rays:]:
+            self.voxels.add_rays(cam, ends, hit)
+        self._voxel_rays = len(rays)
+        return self.voxels
 
     def _in_the_way(self, here: Tuple[float, float, float], u: Tuple[float, float],
                     length: float) -> Optional[float]:

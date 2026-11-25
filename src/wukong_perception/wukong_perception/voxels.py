@@ -12,11 +12,14 @@ to be lower: wrong under a branch, an eave or a porch roof.)
 （heightmap.FreeSpace 按列记录射线穿过的最低高度，认为整列都比它低：树枝、屋檐、
 门廊顶下面就错了。）
 
-Occupied wins over free: a voxel that was hit needs clear_ratio free
-crossings per hit before it counts as free again. A stereo camera may match
-the wall behind a thin branch, and that ray then seems to pass through the
-branch. 已占据优先：被击中的格子，每次击中需要 clear_ratio 次空射线才能重新算空。
-双目相机可能在细枝处匹配到后面的墙，这条射线看起来就“穿过”了细枝。
+Occupied wins over free: a hit makes a voxel occupied at once, whatever was
+seen there before (something may have come in). It counts as free again only
+after clear_ratio free crossings per hit, all made after the last hit. A
+stereo camera may match the wall behind a thin branch, and that ray then
+seems to pass through the branch. 已占据优先：一次击中立即让格子变成占据，不管之前
+看到过什么（可能有东西进来了）。之后要在最后一次击中以后、每次击中再有 clear_ratio
+次空射线穿过，才重新算空。双目相机可能在细枝处匹配到后面的墙，这条射线看起来就
+“穿过”了细枝。
 
 Pure numpy, no ROS. Points are (north, east, height), as in geometry.py.
 纯 numpy，不依赖 ROS。
@@ -52,7 +55,7 @@ class VoxelConfig:
 
 
 class VoxelMap:
-    """Counts of hits and free crossings per voxel, around the takeoff point."""
+    """Per voxel, around the takeoff point: hits, and free crossings since the last hit."""
 
     def __init__(self, center: Tuple[float, float], cfg: VoxelConfig = VoxelConfig()) -> None:
         self.cfg = cfg
@@ -86,9 +89,10 @@ class VoxelMap:
         crossed free, stopping one voxel short of the hit, and the hit voxel
         occupied; a ray without one marks free only its first no_return_free
         metres. Each voxel counts at most once per frame, and a voxel hit in
-        the frame is not also counted free in it. 有回波的射线：沿途到击中点前一格算空，
-        击中的格子算占据；没有回波的射线只有前 no_return_free 米算空。每帧每个格子最多
-        计一次，本帧被击中的格子不再计为空。
+        the frame is not also counted free in it; a hit drops the free
+        crossings seen before it. 有回波的射线：沿途到击中点前一格算空，击中的格子算
+        占据；没有回波的射线只有前 no_return_free 米算空。每帧每个格子最多计一次，本帧被
+        击中的格子不再计为空；击中会清掉此前的空射线计数。
         """
         cam = np.asarray(cam, np.float64)
         ends = np.asarray(ends, np.float64)
@@ -102,6 +106,9 @@ class VoxelMap:
         frees = np.unique(np.concatenate(free_idx)) if free_idx else np.zeros(0, np.int64)
         frees = np.setdiff1d(frees, hits, assume_unique=True)
         _bump(self.hits, hits)
+        # Only crossings after the last hit can clear a voxel. 只有最后一次击中之后的
+        # 空射线才能清除。
+        self.frees.reshape(-1)[hits] = 0
         _bump(self.frees, frees)
         self.scans += 1
 
@@ -178,14 +185,26 @@ class VoxelMap:
         counts if any part of it is inside. 机体按竖直圆柱计算（半径 radius，上下各
         half_height）：多旋翼是扁的，高度误差也比水平误差小。扫过的空间全部在确认为空
         的格子里时返回 None，否则返回第一次碰到其他格子的位置离 a 多远。
+
+        The path is cut into steps of at most res / 2. What the body sweeps in
+        one step lies inside the body at the step's midpoint grown by half the
+        step (across and up separately), so every point of the path is
+        covered, not only sample points; the distance returned is the start of
+        the first step that may touch, never past the first contact.
+        路径切成不超过 res / 2 的小段。一小段里机体扫过的空间，包含在这一段中点处、按半段
+        位移加大（水平、竖直分别加）的机体里，所以路径上每一点都被覆盖，而不只是采样点；
+        返回的是第一个可能接触的小段的起点，不会超过第一次接触的位置。
         """
         if half_height is None:
             half_height = radius
         a, b = np.asarray(a, np.float64), np.asarray(b, np.float64)
         length = float(np.linalg.norm(b - a))
         n = max(1, int(math.ceil(length / (self.res / 2))))
-        t = np.linspace(0.0, length, n + 1)
-        centres = a + (t / max(length, 1e-9))[:, None] * (b - a)        # (samples, 3)
+        t = np.linspace(0.0, length, n + 1)[:-1]                         # where each step starts
+        half_move = (b - a) / n / 2
+        centres = a + (t / max(length, 1e-9))[:, None] * (b - a) + half_move   # (steps, 3)
+        radius = radius + float(np.linalg.norm(half_move[:2]))
+        half_height = half_height + abs(float(half_move[2]))
         rh = int(math.ceil(radius / self.res)) + 1
         rv = int(math.ceil(half_height / self.res)) + 1
         dh, dv = np.arange(-rh, rh + 1), np.arange(-rv, rv + 1)

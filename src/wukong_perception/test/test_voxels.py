@@ -60,6 +60,24 @@ def test_occupied_wins_until_enough_free_rays_cross_it():
     assert m.states(target)[0] == FREE
 
 
+def test_a_hit_after_free_crossings_makes_the_voxel_occupied_at_once():
+    """Something may have come in: what was seen there before does not outweigh a new hit."""
+    cfg = VoxelConfig(clear_ratio=3)
+    m = VoxelMap((0.0, 0.0), cfg)
+    target = np.array([(6.1, 0.1, 5.0)])
+    through = np.array([(12.0, 0.2, 5.0)])
+    m.assume_free(Ball(CAM, 8.0))                  # the open column counts as seen free too
+    for _ in range(cfg.clear_ratio):
+        m.add_rays(CAM, through, np.array([True]))
+    assert m.states(target)[0] == FREE
+    m.add_rays(CAM, target, np.array([True]))
+    # Cleared again only by crossings after the hit. 只有击中之后的空射线才能再清除。
+    for k in range(cfg.clear_ratio):
+        assert m.states(target)[0] == OCCUPIED, k
+        m.add_rays(CAM, through, np.array([True]))
+    assert m.states(target)[0] == FREE
+
+
 def test_a_voxel_hit_in_a_frame_is_not_also_free_in_it():
     m = VoxelMap((0.0, 0.0))
     ends = np.array([(6.1, 0.1, 5.0), (12.0, 0.2, 5.0)])   # one ray stops where the other passes
@@ -90,6 +108,50 @@ def test_swept_volume_must_lie_in_free_voxels():
     assert d == pytest.approx(8.1 - 1.0, abs=0.5)
     # Up out of the cone: blocked at once, as nothing there was seen. 向上出了视场，立即受阻。
     assert m.first_blocked(CAM, (0.0, 0.0, 9.0), radius=1.0) < 1.0
+
+
+def _first_touch(m, a, b, voxel, radius=1.5, half_height=0.75):
+    """Return where the body moving a -> b first touches the voxel (by dense sampling), or None."""
+    a, b = np.asarray(a), np.asarray(b)
+    mid = m.origin + (np.floor((np.asarray(voxel) - m.origin) / m.res) + 0.5) * m.res
+    if (mid - a) @ (b - a) / np.linalg.norm(b - a) < -m.res / 2:
+        return None                                  # behind the drone: never entered
+    t = np.linspace(0.0, 1.0, 4001)[:, None]
+    gap = np.maximum(np.abs(a + t * (b - a) - mid) - m.res / 2, 0.0)
+    touch = (np.linalg.norm(gap[:, :2], axis=1) < radius) & (gap[:, 2] < half_height)
+    return float(t[np.argmax(touch), 0]) * float(np.linalg.norm(b - a)) if touch.any() else None
+
+
+def _one_hit(voxel):
+    """Return a small map, free all round CAM except one occupied voxel."""
+    m = VoxelMap((0.0, 0.0), VoxelConfig(size=20.0, top=12.0))
+    m.assume_free(Ball(CAM, 7.0))
+    flat, _ = m._index(np.array([voxel]))
+    m.hits.reshape(-1)[flat] = 1
+    m.frees.reshape(-1)[flat] = 0
+    return m
+
+
+def test_a_voxel_touched_between_samples_still_blocks():
+    """On a slanted move the body can brush a voxel's corner between two samples."""
+    voxel, b = (2.875, 1.125, 5.125), (3.0, 0.35, 3.5)        # 26 deg down
+    m = _one_hit(voxel)
+    touch = _first_touch(m, CAM, b, voxel)
+    assert touch == pytest.approx(1.684, abs=0.01)
+    d = m.first_blocked(CAM, b, radius=1.5, half_height=0.75)
+    assert d is not None and touch - 0.2 <= d <= touch
+
+
+def test_the_swept_check_never_reports_a_contact_late():
+    rng = np.random.default_rng(1)
+    for _ in range(150):
+        b = np.asarray(CAM) + (3.0, rng.uniform(-1.0, 1.0), rng.uniform(-2.0, 2.0))
+        voxel = np.asarray(CAM) + rng.uniform(0.2, 0.9) * (b - CAM) + rng.normal(0.0, 1.0, 3)
+        m = _one_hit(voxel)
+        touch = _first_touch(m, CAM, b, voxel)
+        d = m.first_blocked(CAM, b, radius=1.5, half_height=0.75)
+        if touch is not None:
+            assert d is not None and d <= touch + 1e-9, (b, voxel, touch, d)
 
 
 def test_something_behind_the_drone_does_not_block_moving_away():

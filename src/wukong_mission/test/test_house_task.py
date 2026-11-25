@@ -235,12 +235,12 @@ def test_photos_along_a_row_know_the_home_and_their_claim():
 
 
 class _Scans:
-    """Stands in for DepthCamera: the clouds discovery has seen."""
+    """Stands in for DepthCamera: the clouds and depth frames discovery has seen."""
 
-    def __init__(self, *clouds):
+    def __init__(self, *clouds, rays=()):
         self.clouds = [np.asarray(c, float) for c in clouds]
         self.labels = [f'look around {k + 1}' for k in range(len(self.clouds))]
-        self.rays = []
+        self.rays = list(rays)
 
 
 def _open_ground(center=(0.0, 0.0), radius=9.0):
@@ -250,11 +250,28 @@ def _open_ground(center=(0.0, 0.0), radius=9.0):
     return np.column_stack([center[0] + r * np.cos(a), center[1] + r * np.sin(a), 0.0 * a])
 
 
+def _frame(cam, heading):
+    """Return one depth frame over flat open ground, as geometry.depth_rays gives it."""
+    yaw, pitch = np.meshgrid(np.radians(np.linspace(-36.5, 36.5, 60)),   # the OAK-D's view
+                             np.radians(np.linspace(-29.0, 29.0, 46)))
+    yaw, pitch = heading + yaw.ravel(), pitch.ravel()
+    d = np.column_stack([np.cos(pitch) * np.cos(yaw), np.cos(pitch) * np.sin(yaw),
+                         np.sin(pitch)])
+    to_ground = np.where(d[:, 2] < 0, cam[2] / np.maximum(-d[:, 2], 1e-9), np.inf)
+    hit = to_ground < DEPTH_RANGE
+    ends = np.asarray(cam) + np.minimum(to_ground, DEPTH_RANGE)[:, None] * d
+    return tuple(cam), ends, hit
+
+
+def _look_around(cam, headings=8):
+    return [_frame(cam, 2 * math.pi * k / headings) for k in range(headings)]
+
+
 def test_discovery_moves_on_the_way_it_faced_on_the_ground():
     """Nothing within depth range: step on (east here) until the scans reach search_radius."""
     t = HouseTask(world(), GutterRequest('x', 'nearest', []), (1.0, 2.0), '/tmp', FakeJudge(),
                   'x', facing=math.pi / 2)
-    t.depth = _Scans(_open_ground((1.0, 2.0)))
+    t.depth = _Scans(_open_ground((1.0, 2.0)), rays=_look_around((1.0, 2.0, 6.0)))
     pose = (1.0, 2.0, 6.0, 0.0)
     steps = []
     while True:
@@ -267,11 +284,27 @@ def test_discovery_moves_on_the_way_it_faced_on_the_ground():
         assert go.look_at[0] == pytest.approx(go.north) and go.look_at[1] > go.east  # facing east
         pose = (go.north, go.east, go.altitude, math.pi / 2)
         steps.append((go.north, go.east, go.altitude))
-    reach = t.world.search_radius - DEPTH_RANGE
+        t.depth.rays.append(_frame(pose[:3], math.pi / 2))                     # the look ahead
     assert steps and all(s[0] == 1.0 and s[2] == 6.0 for s in steps)
-    assert [s[1] - 2.0 for s in steps] == pytest.approx(
-        [3.0 * k for k in range(1, int(reach // 3.0) + 1)])
-    assert note == 'no building within 30 m'
+    # The last step is shorter, so that the scans reach search_radius ahead.
+    # 最后一步短一些，让扫描正好覆盖到前方的搜索半径。
+    assert [s[1] - 2.0 for s in steps] == pytest.approx([3.0, 6.0, 9.0, 11.5])
+    assert t.world.search_radius - DEPTH_RANGE == pytest.approx(11.5)
+    assert note == 'no building within 18.5 m all round, nor 30.0 m ahead on the takeoff heading'
+
+
+@pytest.mark.parametrize('frames', [
+    [],                                                    # no frame came in
+    [_frame((0.0, 0.0, 6.0), math.pi)],                    # one came in, looking the other way
+])
+def test_discovery_does_not_move_on_where_it_has_not_seen(frames):
+    """Nothing in the way is not enough: the way itself must have been seen free."""
+    t = HouseTask(world(), GutterRequest('x', 'nearest', []), (0.0, 0.0), '/tmp', FakeJudge(),
+                  'x', facing=0.0)
+    t.depth = _Scans(_open_ground(), rays=frames)
+    skills, _, note = t.on_decide(DISCOVERY, (0.0, 0.0, 6.0, 0.0))
+    assert skills is None
+    assert 'seen free for only' in note
 
 
 def test_discovery_does_not_move_on_towards_something_in_the_way():
