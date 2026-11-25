@@ -6,9 +6,10 @@ import math
 
 import numpy as np
 import pytest
-from wukong_flight.skills import Decide, GoTo, ReturnHome, Scan, Takeoff
+from wukong_flight.skills import Decide, GoTo, HeightField, ReturnHome, Scan, Takeoff, TakePhoto
+from wukong_mission.explore import Stop
 from wukong_mission.gutter_task import GutterRequest
-from wukong_mission.house_task import (clip_to_window, DISCOVERY, HouseTask, LOOK_AHEAD,
+from wukong_mission.house_task import (clip_to_window, CONTINUE, DISCOVERY, HouseTask, LOOK_AHEAD,
                                        ring_stations)
 from wukong_mission.judge import FakeJudge
 from wukong_mission.world import WorldMap
@@ -315,3 +316,55 @@ def test_discovery_does_not_move_on_towards_something_in_the_way():
     skills, _, note = t.on_decide(DISCOVERY, (0.0, 0.0, 6.0, 0.0))
     assert skills is None
     assert 'something 5.0 m ahead' in note
+
+
+def _class_a(frames):
+    """Return a task that flies only where seen free, after the given depth frames."""
+    import dataclasses
+    t = HouseTask(world(), GutterRequest('x', 'nearest', []), (0.0, 0.0), '/tmp', FakeJudge(),
+                  'x', facing=0.0)
+    t.survey = dataclasses.replace(t.survey, seen_free_only=True)
+    t.depth = _Scans(_open_ground(), rays=frames)
+    t._record_trail((0.0, 0.0, 6.0))                        # above the takeoff point
+    return t
+
+
+def _photo(t, label, goal, face):
+    from wukong_mission.inspection import PhotoTarget
+    t.targets[label] = PhotoTarget(label, 'north gutter', 1, 1, face, face, 3.0, goal)
+    return Stop(goal, face, (TakePhoto(label),), label)
+
+
+def test_class_a_flies_what_it_has_seen_and_looks_before_going_on():
+    """One frame looking north: the photo there is taken; the way east must be looked at first."""
+    t = _class_a([_frame((0.0, 0.0, 6.0), 0.0)])
+    t._queue = [_photo(t, 'a', (8.0, 0.0, 6.0), (14.0, 0.0)),
+                _photo(t, 'b', (8.0, 14.0, 6.0), (14.0, 14.0))]
+    t._queue_kind = 'inspect'
+    skills, _, note = t._run_queue((0.0, 0.0, 6.0, 0.0), world().limits, 'photos')
+    kinds = [type(k).__name__ for k in skills]
+    assert TakePhoto('a') in skills and TakePhoto('b') not in skills
+    look, scan, decide = skills[kinds.index('Scan') - 1:kinds.index('Scan') + 2]
+    assert decide == Decide(CONTINUE) and scan.label.startswith('way check')
+    assert look.look_at[1] > look.east + 5.0                           # facing east, towards b
+    assert isinstance(skills[-1], ReturnHome) and 'looking along the way to b' in note
+    # Nothing new seen from there: b is skipped and the drone goes home.
+    # 在那里没有看到新的东西：跳过 b，返航。
+    skills, _, _ = t.on_decide(CONTINUE, (look.north, look.east, look.altitude, math.pi / 2))
+    assert [k for k in skills if isinstance(k, (TakePhoto, Scan))] == []
+    assert isinstance(skills[-1], ReturnHome)
+    assert [k.label for k in t.skipped] == ['b'] and 'not seen free' in t.skipped[0].reason
+    assert 'b' not in t.targets
+
+
+def test_class_a_checks_decisions_without_the_unseen_part_of_the_house():
+    """The voxel map settles unseen space; that zone only steers the planner."""
+    import dataclasses
+    from wukong_mission.house_task import UNSEEN_HOUSE
+    t = _class_a([])
+    zones = (HeightField((0.0, 0.0), 1.0, {(10, 0): 6.0}, 'surroundings (seen)'),
+             HeightField((0.0, 0.0), 1.0, {(12, 0): 18.0}, UNSEEN_HOUSE))
+    lim = dataclasses.replace(world().limits, no_fly=zones)
+    assert [z.name for z in t._flight_limits(lim).no_fly] == ['surroundings (seen)']
+    t.survey = dataclasses.replace(t.survey, seen_free_only=False)
+    assert t._flight_limits(lim) is lim

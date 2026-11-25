@@ -308,7 +308,7 @@ def plan_inspection(eaves: Sequence[Eave], surfaces: Sequence[HeightField],
     对给定屋檐逐段拍照；无法拍摄的段记录原因后跳过。最后回到起飞点上方。
     """
     from .pathplan import choose_viewpoint, Planner, route_home, ViewConfig
-    planner = Planner(limits)
+    planner = Planner(limits, home=home)
     view = view or ViewConfig()
     skills: List[Skill] = []
     targets: Dict[str, PhotoTarget] = {}

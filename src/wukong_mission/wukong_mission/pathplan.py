@@ -24,17 +24,26 @@ CAMERA_ABOVE_BODY = 0.26                 # m, x500_depth camera mount
 class Planner:
     """Path finding and visibility against one set of limits."""
 
-    def __init__(self, limits: Limits, grid: float = 0.5, step: float = 0.25) -> None:
+    def __init__(self, limits: Limits, grid: float = 0.5, step: float = 0.25,
+                 home: Optional[Tuple[float, float]] = None) -> None:
         self.limits = limits
         self.zones = [z.inflated(limits.margin) for z in limits.no_fly]
         self.grid = grid
         self.step = step
+        # The takeoff point, if paths must keep within max_distance of it, as
+        # check_plan() requires (a detour round a row's end once went past it).
+        # 起飞点：给出时路径也要在 max_distance 以内，与 check_plan() 一致（绕过联排一端的
+        # 路线曾超出）。
+        self.home = home
 
     # -- collision --------------------------------------------------------------------
 
     def free(self, p: Point3) -> bool:
         lim = self.limits
         if not lim.min_altitude <= p[2] <= lim.max_altitude:
+            return False
+        if (self.home is not None
+                and math.hypot(p[0] - self.home[0], p[1] - self.home[1]) > lim.max_distance):
             return False
         return not any(z.contains(*p) for z in self.zones)
 

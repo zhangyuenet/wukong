@@ -289,9 +289,13 @@ ros2 run wukong_mission run_task "帮我检查一下旁边这栋房子所有的�
 ```bash
 python3 sim/perception_check.py two_storey     # 只检查屋檐识别
 python3 sim/mission_check.py two_storey row_end --drift 0.4   # 整个任务，含位置漂移
+python3 sim/mission_check.py --seen-free row_end   # M4 A 级：只飞确认为空的空间
 ```
 
-`mission_check.py` 用光线投射代替深度相机，每个场景十几秒。
+`mission_check.py` 用光线投射代替深度相机，每个场景十几秒。`--seen-free` 打开
+`SurveyConfig.seen_free_only`，并且沿每段航线每隔 1 米取一帧深度加入体素地图（模拟
+边飞边建图），每个场景一两分钟。Gazebo 中的飞行暂时还不在飞行中取帧，所以这个开关
+默认关闭。
 
 ## 10. 常见问题
 

@@ -6,8 +6,9 @@ import math
 
 import numpy as np
 import pytest
-from wukong_flight.skills import GoTo
-from wukong_mission.explore import back_along, ExploreConfig, legs_facing_ahead, reach
+from wukong_flight.skills import GoTo, TakePhoto
+from wukong_mission.explore import (back_along, ExploreConfig, legs_facing_ahead, reach, sloped,
+                                    Stop, stops_of)
 from wukong_perception.voxels import Ball, VoxelMap
 
 CAM = (0.0, 0.0, 5.0)
@@ -115,3 +116,63 @@ def test_a_climb_can_be_checked_further_with_a_flat_body_than_a_ball():
     # 从悬停开始，扁圆柱也只能前进约 2 米：前方 3-4 米处扫过空间的顶部在这里看不到。
     # 爬升要从同一条线更靠后的地方看到，也就是边飞边看（沿途的深度帧）。
     assert flat >= 1.5 and ball == 0.0, (flat, ball)
+
+
+def test_a_photo_plan_becomes_its_viewpoints_with_their_photos():
+    plan = [GoTo(5.0, 0.0, 6.0), GoTo(8.0, 1.0, 6.0, look_at=(12.0, 1.0)), TakePhoto('a'),
+            TakePhoto('b'), GoTo(8.0, 4.0, 6.0, look_at=(12.0, 4.0)), TakePhoto('c'),
+            GoTo(0.0, 0.0, 6.0)]                                         # the way home
+    assert stops_of(plan) == [
+        Stop((8.0, 1.0, 6.0), (12.0, 1.0), (TakePhoto('a'), TakePhoto('b')), 'a'),
+        Stop((8.0, 4.0, 6.0), (12.0, 4.0), (TakePhoto('c'),), 'c')]
+
+
+def _slope(a, b):
+    return math.degrees(math.atan2(abs(b[2] - a[2]), math.dist(a[:2], b[:2])))
+
+
+def _all_clear(a, b):
+    return True
+
+
+def _nowhere(p):
+    return False
+
+
+def _legs(start, route):
+    return list(zip([start] + route, route))
+
+
+def test_straight_up_becomes_a_climb_along_the_next_leg():
+    start, route = (0.0, 0.0, 5.0), [(0.0, 0.0, 9.0), (20.0, 0.0, 9.0)]
+    out = sloped(start, route, _all_clear, _nowhere)
+    assert out[-1] == (20.0, 0.0, 9.0)
+    assert all(_slope(a, b) <= 20.0 + 1e-6 for a, b in _legs(start, out))
+    run = 4.0 / math.tan(math.radians(20))
+    assert out[0][2] == 9.0 and out[0][0] == pytest.approx(run, abs=0.3)
+
+
+def test_straight_down_becomes_a_descent_along_the_leg_before():
+    start = (0.0, 0.0, 11.0)
+    route = [(20.0, 0.0, 11.0), (20.0, 0.0, 4.5)]                      # over a roof, then down
+    out = sloped(start, route, _all_clear, _nowhere)
+    assert out[-1] == (20.0, 0.0, 4.5)
+    assert all(_slope(a, b) <= 20.0 + 1e-6 for a, b in _legs(start, out))
+    assert sum(math.dist(a, b) for a, b in _legs(start, out)) < 22.0    # no detour
+
+
+def test_a_steep_climb_backs_off_first():
+    """6.5 m up needs 17.9 m of run; with 10 m to the goal, the drone first backs away."""
+    start = (0.0, 0.0, 4.5)
+    out = sloped(start, [(10.0, 0.0, 11.0)], _all_clear, _nowhere)
+    assert out[-1] == (10.0, 0.0, 11.0) and out[0][0] < -7.0 and out[0][2] == 4.5
+    assert all(_slope(a, b) <= 20.0 + 1e-6 for a, b in _legs(start, out))
+
+
+def test_no_slope_without_room_for_it_except_straight_up_in_the_open_column():
+    def wall_behind(a, b):
+        return min(a[0], b[0]) >= -2.0
+    assert sloped((0.0, 0.0, 4.5), [(10.0, 0.0, 11.0)], wall_behind, _nowhere) is None
+    in_column = sloped((0.0, 0.0, 4.5), [(0.0, 0.0, 11.0), (10.0, 0.0, 11.0)], wall_behind,
+                       lambda p: math.hypot(p[0], p[1]) < 1.0)
+    assert in_column == [(0.0, 0.0, 11.0), (10.0, 0.0, 11.0)]

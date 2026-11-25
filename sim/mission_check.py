@@ -53,6 +53,11 @@ class RayCastDepth:
         self.drift = drift
         self.rng = np.random.default_rng(seed)
         self.err = np.zeros(3)
+        # Every frame for the voxel map, in order: the scans and, with
+        # flight_step, frames along each leg (stride 8). 体素地图用的全部深度帧：
+        # 扫描，以及设了 flight_step 时沿每段航线每隔这么远取的一帧。
+        self.frames: List[tuple] = []
+        self.flight_step = 0.0
 
     def capture(self, label: str, pose: Sequence[float], done: Callable[[bool], None]) -> None:
         depth = raycast.render_depth(self.tris, pose, stride=4)
@@ -64,10 +69,22 @@ class RayCastDepth:
             tuple(pose[3:])
         self.clouds.append(depth_to_points(depth, K, est, stride=4))
         self.rays = getattr(self, 'rays', []) + [depth_rays(depth, K, est, stride=4)]
+        self.frames.append(self.rays[-1])
         self.errors = getattr(self, 'errors', []) + [tuple(self.err)]
         self.labels.append(label)
         self.poses.append(tuple(pose) + (0.0,) * (6 - len(pose)))
         done(True)
+
+    def in_flight(self, a: Sequence[float], b: Sequence[float], heading: float) -> None:
+        """Add the frames taken along the leg a -> b, every flight_step metres, for the map."""
+        if self.flight_step <= 0:
+            return
+        n = int(math.dist(a, b) // self.flight_step)
+        for k in range(1, n + 1):
+            p = [a[i] + (b[i] - a[i]) * k * self.flight_step / math.dist(a, b) for i in range(3)]
+            depth = raycast.render_depth(self.tris, (*p, heading), stride=8)
+            est = (p[0] + self.err[0], p[1] + self.err[1], p[2] + self.err[2], heading)
+            self.frames.append(depth_rays(depth, K, est, stride=8))
 
 
 CLEARANCE = 1.0   # m: closer than this to a real building counts as a collision
@@ -114,11 +131,11 @@ def _too_close(a, b, tris):
 
 
 def fly(task: HouseTask, plan: List[Skill], start: Tuple[float, float], limits: Limits,
-        tris: Optional[np.ndarray] = None) -> Tuple[List[str], List[str], int]:
-    """Execute a plan with an ideal vehicle; returns (photos, problems, scans)."""
+        tris: Optional[np.ndarray] = None) -> Tuple[List[str], List[str], int, float]:
+    """Execute a plan with an ideal vehicle; returns (photos, problems, scans, metres flown)."""
     pos = (start[0], start[1], 0.0)
     heading = task.facing
-    photos, problems, scans = [], [], 0
+    photos, problems, scans, flown = [], [], 0, 0.0
     i = 0
     while i < len(plan):
         s = plan[i]
@@ -132,9 +149,13 @@ def fly(task: HouseTask, plan: List[Skill], start: Tuple[float, float], limits: 
                 problems.append(f'skill {i + 1}: leg to N {new[0]:.1f} E {new[1]:.1f} alt '
                                 f'{new[2]:.1f} passes {d:.1f} m from the house at '
                                 f'N {n:.1f} E {e:.1f} alt {z:.1f}')
-            pos = new
+            # The drone turns towards look_at as the leg starts (Mission).
+            # 飞机在这一段开始时转向 look_at。
             if s.look_at is not None:
                 heading = math.atan2(s.look_at[1] - s.east, s.look_at[0] - s.north)
+            task.depth.in_flight(pos, new, heading)
+            flown += math.dist(pos, new)
+            pos = new
         elif isinstance(s, Scan):
             task.depth.capture(s.label, (*pos, heading), lambda ok: None)
             scans += 1
@@ -162,7 +183,7 @@ def fly(task: HouseTask, plan: List[Skill], start: Tuple[float, float], limits: 
         elif isinstance(s, ReturnHome):
             break
         i += 1
-    return photos, problems, scans
+    return photos, problems, scans, flown
 
 
 def planned_report(task: HouseTask) -> dict:
@@ -193,7 +214,7 @@ def task_ground(task: HouseTask) -> float:
 
 
 def check(name: str, verbose: bool = False, drift: float = 0.0, register: bool = False,
-          classify: bool = True) -> bool:
+          classify: bool = True, seen_free: bool = False) -> bool:
     gen = os.path.join(HERE, 'generated', name)
     truth = json.load(open(os.path.join(gen, 'truth.json')))
     world = load_world(os.path.join(gen, 'map.yaml'))
@@ -211,14 +232,21 @@ def check(name: str, verbose: bool = False, drift: float = 0.0, register: bool =
     if classify and 'buildings' in truth:
         task.classifier = TruthClassifier(truth)
     task.register = register
+    if seen_free:
+        # Class A: only through space seen free, with frames mapped in flight.
+        # A 级：只飞确认为空的空间，飞行中的深度帧也加入地图。
+        import dataclasses
+        task.survey = dataclasses.replace(task.survey, seen_free_only=True)
+        task.depth.flight_step = 1.0
     plan = task.plan()
     print(f'== {name}')
     t0 = time.time()
     solid = raycast.load_triangles(os.path.join(gen, f'wukong_{name}.sdf'), skip_debris=True)
-    photos, problems, scans = fly(task, plan, start, world.limits, solid)
+    photos, problems, scans, flown = fly(task, plan, start, world.limits, solid)
     eaves_json = os.path.join(out, 'eaves.json')
     task._ground = json.load(open(eaves_json))['ground_level'] if os.path.exists(eaves_json) else 0
     print(f'   {scans} scans, {len(photos)} photos planned, {len(task.skipped)} skipped, '
+          f'{flown:.0f} m flown, '
           f'{time.time() - t0:.0f}s')
     for p in problems:
         print('   PROBLEM', p)
@@ -249,11 +277,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help='position-estimate error in m (random walk, like GPS noise)')
     ap.add_argument('--register', action='store_true',
                     help='align scans to each other before merging (experimental, off in flight)')
+    ap.add_argument('--seen-free', action='store_true',
+                    help='fly only through space seen free, mapping frames in flight (M4 class A)')
     ap.add_argument('--no-classify', action='store_true',
                     help='skip the house-type judgement (the drone must then refuse to inspect)')
     args = ap.parse_args(argv)
     # Every scenario is checked, also after one fails. 一个场景失败后其余的照样检查。
-    results = [check(n, args.verbose, args.drift, args.register, not args.no_classify)
+    results = [check(n, args.verbose, args.drift, args.register, not args.no_classify,
+                     args.seen_free)
                for n in args.scenarios]
     return 0 if all(results) else 1
 

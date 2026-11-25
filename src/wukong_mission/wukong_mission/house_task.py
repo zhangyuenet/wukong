@@ -39,9 +39,11 @@ from wukong_perception.heightmap import (building_rectangle, buildings, eave_lin
 from wukong_perception.register import merge_registered, register_scans
 from wukong_perception.voxels import Column, VoxelMap
 
-from .explore import ExploreConfig
+from .explore import (back_along, ExploreConfig, legs_facing_ahead, reach, sloped, Stop,
+                      stops_of)
 from .gutter_task import GutterRequest, GutterTask, matching_gutters
-from .inspection import InspectionConfig, plan_inspection, surfaces_from_heightmap
+from .inspection import (InspectionConfig, plan_inspection, Skipped,
+                         surfaces_from_heightmap)
 from .judge import Judge
 from .pathplan import Planner, route_home
 from .world import WorldMap
@@ -52,6 +54,9 @@ LOOK_AHEAD = 'look ahead'
 CLASSIFY = 'what kind of house'
 OVERVIEW = 'house overview'
 SURVEY_STEP = 'survey step'
+CONTINUE = 'continue'              # go on with the queued stops (seen_free_only)
+WAY_CHECK = 'way check'            # scan along the way before going on
+UNSEEN_HOUSE = 'house (not seen yet)'   # no-fly zone of the building's unseen cells
 
 
 @dataclass(frozen=True)
@@ -71,12 +76,20 @@ class SurveyConfig:
     advance_clearance: float = 4.0
     min_advance: float = 0.5
     # The column above the takeoff point that the operator confirms open, from
-    # the ground to a metre above the discovery altitude: a level camera does
-    # not see beside the drone, so the first step needs this much known round it
-    # (docs/OBSTACLE_AVOIDANCE.md, section 9). 操作员确认开阔的起飞点上方竖直通道，
-    # 从地面到环视高度以上一米：水平的相机看不到机身旁边，第一步需要周围这么大的
-    # 已知空间。
+    # the ground to the highest altitude allowed: the only place class A climbs
+    # or descends straight, and, since a level camera does not see beside the
+    # drone, the first step needs this much known round it
+    # (docs/OBSTACLE_AVOIDANCE.md, L0 and section 9). 操作员确认开阔的起飞点上方竖直
+    # 通道，从地面到允许的最高高度：A 级只在这里竖直升降；水平的相机看不到机身旁边，
+    # 第一步需要周围这么大的已知空间。
     open_column_radius: float = 3.5
+    # M4 class A (docs/OBSTACLE_AVOIDANCE.md, L2): fly only where the voxel map
+    # has seen the way free; where it has not, fly the part seen free, look
+    # along the rest and decide again, or skip that stop. Off until depth frames
+    # are also mapped in flight: from a hover a level camera cannot see a climb.
+    # M4 A 级：只飞体素地图确认为空的路线；没确认的部分先飞已确认的一段，看一眼再决定，
+    # 或者跳过这一站。在飞行中的深度帧也加入地图之前不打开：悬停时水平相机看不到爬升段。
+    seen_free_only: bool = False
     min_building_height: float = 2.5    # m; lower things (cars, fences) are not houses
     min_building_area: float = 20.0     # m^2
     low_offset: float = 7.0             # m out from the outline, low ring
@@ -139,6 +152,14 @@ def clip_to_window(eaves: Sequence[Eave], window: Rectangle, margin: float = 1.0
         s, t = (at(a), at(b)) if u0 < u1 else (at(b), at(a))
         out.append(Eave(e.name, s, t, e.height, e.side_bearing_deg))
     return out
+
+
+def _heading_after(legs: Sequence[GoTo], heading: float) -> float:
+    """Return the heading after flying legs: towards the last point one was told to face."""
+    for g in reversed(legs):
+        if g.look_at is not None:
+            return math.atan2(g.look_at[1] - g.east, g.look_at[0] - g.north)
+    return heading
 
 
 def _long_axis(r: Rectangle) -> Rectangle:
@@ -236,6 +257,21 @@ class HouseTask(GutterTask):
         self.voxels: Optional[VoxelMap] = None
         self._voxel_rays = 0
         self.explore = ExploreConfig()
+        # Where the drone has flown, the first point above the takeoff point
+        # (class A goes home this way), and the points of the skills just given.
+        # 飞过的路线（A 级沿它回家），第一个点在起飞点上方；以及刚给出的技能经过的点。
+        self.trail: List[Tuple[float, float, float]] = []
+        self._flying: List[Tuple[float, float, float]] = []
+        # Stops still to fly to (seen_free_only): a survey station or the photo
+        # viewpoints. 还要去的站点或拍照视点。
+        self._queue: List[Stop] = []
+        self._queue_kind = ''
+        self._queue_limits: Optional[Limits] = None
+        self._station_from = (0.0, 0.0)        # progress and angle when the station was chosen
+        self._skipped_stations: List[Tuple[float, float, float]] = []
+        self._via_column: set = set()          # stops already sent round by the open column
+        self._looks: List[Tuple[Tuple[float, float, float], float]] = []
+        self.way_checks = 0
         self.building_top = 0.0
         self.ring = 'high'             # high ring first, then low
         self.progress = 0.0            # radians travelled round the building in this ring
@@ -286,8 +322,9 @@ class HouseTask(GutterTask):
         ground = None
         if survey_only:
             labels = list(getattr(self.depth, 'labels', []))
+            # Scans along the way look past the house, not at it. 沿途的扫描不是对着房屋。
             kept = [c for c, lab in zip(clouds, labels)
-                    if not str(lab).startswith((LOOK_AROUND, LOOK_AHEAD))]
+                    if not str(lab).startswith((LOOK_AROUND, LOOK_AHEAD, WAY_CHECK))]
             if len(kept) >= 4:
                 everything = merged(clouds)
                 if everything is not None:
@@ -301,8 +338,11 @@ class HouseTask(GutterTask):
     def on_decide(self, label: str, pose: Sequence[float]
                   ) -> Tuple[Optional[list], Optional[Limits], str]:
         self.visited.append((pose[0], pose[1]))
+        self._record_trail(pose)
         if label == DISCOVERY:
             return self._after_discovery(pose)
+        if label == CONTINUE:
+            return self._continue(pose)
         if label == SURVEY_STEP:
             return self._survey_step(pose)
         if label == CLASSIFY:
@@ -340,9 +380,9 @@ class HouseTask(GutterTask):
         look = self.look = self._front_point()
         # Steady: the ruler is drawn with the recorded pose. 刻度尺按记录的位姿绘制，须等稳定。
         skills = [GoTo(*here, look_at=look), TakePhoto(OVERVIEW, steady=True), Decide(CLASSIFY)]
-        planner = Planner(self._survey_limits(hm))
-        home = route_home(planner, here, self.start) or []
-        return (skills + [GoTo(*p) for p in home] + [ReturnHome()], self._survey_limits(hm),
+        limits = self._survey_limits(hm)
+        home = self._way_home(here, Planner(limits, home=self.start))
+        return (skills + [GoTo(*p) for p in home] + [ReturnHome()], self._flight_limits(limits),
                 'photographing the house to judge what kind it is')
 
     def _advance(self, pose):
@@ -381,6 +421,7 @@ class HouseTask(GutterTask):
             return None
         look = (round(nxt[0] + 10 * u[0], 2), round(nxt[1] + 10 * u[1], 2))
         self.advances += 1
+        self._flying = [nxt]
         note = f'{self.decide_note}: moving {reach:.1f} m on to look again'
         self.decide_note = note
         skills = [GoTo(*nxt, look_at=look), Scan(f'{LOOK_AHEAD} {self.advances}'),
@@ -409,15 +450,220 @@ class HouseTask(GutterTask):
         counted free. 第一次用到时建立，起飞点上方的开阔竖直通道算空。
         """
         if self.voxels is None:
-            s = self.survey
             self.voxels = VoxelMap(self.start)
-            self.voxels.assume_free(Column(self.start, s.open_column_radius, 0.0,
-                                           s.discovery_altitude + 1.0))
-        rays = getattr(self.depth, 'rays', [])
-        for cam, ends, hit in rays[self._voxel_rays:]:
+            self.voxels.assume_free(Column(self.start, self.survey.open_column_radius, 0.0,
+                                           self.world.limits.max_altitude + 1.0))
+        # Every frame for the map, in order: the scans and, where the depth
+        # source keeps them, the frames taken in flight. 地图用的全部深度帧，按顺序：
+        # 扫描，以及深度来源保留的飞行中的帧。
+        frames = getattr(self.depth, 'frames', None)
+        if frames is None:
+            frames = getattr(self.depth, 'rays', [])
+        for cam, ends, hit in frames[self._voxel_rays:]:
             self.voxels.add_rays(cam, ends, hit)
-        self._voxel_rays = len(rays)
+        self._voxel_rays = len(frames)
         return self.voxels
+
+    # -- flying only through space seen free (seen_free_only) ----------------------------
+
+    def _record_trail(self, pose: Sequence[float]) -> None:
+        """Add what was flown since the last decision, and where the drone is now."""
+        self.trail.extend(self._flying)
+        self._flying = []
+        p = tuple(round(float(v), 2) for v in pose[:3])
+        if not self.trail or math.dist(self.trail[-1], p) > 0.1:
+            self.trail.append(p)
+
+    def _continue(self, pose):
+        """Go on with the queued stops after looking along the way."""
+        if not self._queue:
+            return None, None, 'nothing left to fly to'
+        limits = self._queue_limits
+        if self._queue_kind == 'station':
+            # The survey's map grows with every scan. 扫描阶段的地图随每次扫描更新。
+            hm = self._heightmap()
+            if hm is not None:
+                limits = self._survey_limits(hm)
+        return self._run_queue(pose, limits, f'on to {self._queue[0].label}')
+
+    def _run_queue(self, pose, limits: Limits, note: str):
+        """
+        Fly to the queued stops as far as the way has been seen free; look where it has not.
+
+        Each stop's route is planned from where the drone will be (Planner, on
+        the optimistic map) and cut to the part whose swept volume the voxel
+        map has seen free (explore.reach). Stops reached whole are chained; at
+        the first that is not, the drone flies the part seen free, turns to face
+        the rest of the way, scans and decides again. A stop it still cannot go
+        towards after looking from there is skipped. Legs are flown facing the
+        way the drone goes. 每个站点的路线从飞机届时所在的位置规划，再截取扫过的空间已确认
+        为空的一段。能完整到达的站点连续飞；第一个不能完整到达的，先飞已确认的一段，转向
+        剩下的路线扫描一次，再重新决定。在那里看过以后仍然无法前进的站点跳过。每段都朝着
+        前进方向飞。
+        """
+        self._queue_limits = limits
+        voxels = self._update_voxels()
+        planner = Planner(limits, home=self.start)
+        x = self.explore
+        cur = tuple(round(float(v), 2) for v in pose[:3])
+        heading = float(pose[3]) if len(pose) > 3 else self.facing
+        skills: List[Skill] = []
+        flying: List[Tuple[float, float, float]] = []
+        while self._queue:
+            stop = self._queue[0]
+            if stop.home:
+                # Seen free or flown already: no need to check. 已确认为空或已飞过，不必检查。
+                way = self._way_home(cur, planner, flying)
+                skills += [GoTo(*p) for p in way]
+                flying += [tuple(p) for p in way]
+                cur = tuple(way[-1]) if way else cur
+                self._queue.pop(0)
+                continue
+            route = self._route(planner, cur, stop.goal)
+            if route is None:
+                why = 'no way there clear of what has been seen'
+            else:
+                part, whole = reach(voxels, cur, route, x)
+                if whole:
+                    legs = legs_facing_ahead(cur, heading, route, stop.face, x)
+                    skills += legs + list(stop.actions)
+                    flying += [tuple(p) for p in route]
+                    heading = _heading_after(legs, heading)
+                    cur = tuple(stop.goal)
+                    self._queue.pop(0)
+                    if any(isinstance(a, Decide) for a in stop.actions):
+                        break
+                    continue
+                end = tuple(part[-1]) if part else cur
+                nxt = next((tuple(p) for p in route if tuple(p) not in part), tuple(route[-1]))
+                dn, de = nxt[0] - end[0], nxt[1] - end[1]
+                bearing = math.atan2(de, dn)
+                if math.hypot(dn, de) < 0.1:
+                    why = 'the way there goes straight up or down, which the camera cannot see'
+                elif not part and self._looked(end, bearing):
+                    why = 'the way there is not seen free, also after looking along it'
+                else:
+                    self._looks.append((end, bearing))
+                    self.way_checks += 1
+                    ahead = (round(end[0] + 10.0 * math.cos(bearing), 2),
+                             round(end[1] + 10.0 * math.sin(bearing), 2))
+                    skills += legs_facing_ahead(cur, heading, part, ahead, x)
+                    skills += [Scan(f'{WAY_CHECK} {self.way_checks}'), Decide(CONTINUE)]
+                    flying += [tuple(p) for p in part]
+                    cur = end
+                    note = f'{note}; looking along the way to {stop.label}'
+                    break
+            if not self._in_column(cur) and abs(stop.goal[2] - cur[2]) > 1.0 \
+                    and stop.label not in self._via_column:
+                # Change altitude above the takeoff point instead, where the way
+                # up or down is known open. 改到起飞点上方升降，那里的竖直通道是开阔的。
+                self._via_column.add(stop.label)
+                self._queue.insert(0, Stop(cur, None, (), 'above the takeoff point', home=True))
+                continue
+            if self._queue_kind == 'station':
+                return self._skip_station(stop, why, pose)
+            self._skip_photos(stop, why)
+            self._queue.pop(0)
+        self._flying = flying
+        self.decide_note = note
+        home = self._way_home(cur, planner)
+        return (skills + [GoTo(*p) for p in home] + [ReturnHome()], self._flight_limits(limits),
+                note)
+
+    def _route(self, planner: Planner, cur: Tuple[float, float, float],
+               goal: Sequence[float]) -> Optional[List[Tuple[float, float, float]]]:
+        """
+        Plan the way from cur to goal, changing altitude where the camera can see it.
+
+        Above the takeoff point first straight up or down: the open column is
+        the only place class A changes altitude without seeing where it goes
+        (docs/OBSTACLE_AVOIDANCE.md, L0). Elsewhere on a slope it sees ahead
+        (explore.sloped). If neither can be done, the route as planned: its
+        vertical part is then not seen free, and the stop goes round by the
+        column or is skipped. 先在起飞点上方竖直升降：那是 A 级唯一可以不看就升降的
+        地方；其他地方按前方看得见的坡度升降。都做不到时返回原路线：竖直的部分不会确认为空，
+        这一站改为绕到竖直通道升降，或者跳过。
+        """
+        goal = tuple(goal)
+        routes = []
+        if self._in_column(cur) and abs(goal[2] - cur[2]) > 0.3:
+            up = (cur[0], cur[1], round(float(goal[2]), 2))
+            rest = planner.path(up, goal) if planner.segment_free(cur, up) else None
+            if rest is not None:
+                routes.append([up] + rest)
+        direct = planner.path(cur, goal)
+        if direct is not None:
+            routes.append(direct)
+        for route in routes:
+            out = sloped(cur, route, planner.segment_free, self._in_column)
+            if out is not None:
+                return out
+        return routes[0] if routes else None
+
+    def _in_column(self, p: Sequence[float]) -> bool:
+        """Return whether the body at p is wholly inside the open column above the takeoff."""
+        inside = self.survey.open_column_radius - self.explore.radius - self._update_voxels().res
+        return math.dist(p[:2], self.start) <= inside
+
+    def _flight_limits(self, limits: Limits) -> Limits:
+        """
+        Return the limits a decision is checked against.
+
+        Class A (seen_free_only) leaves out the building's unseen cells: they
+        steer the planner, but whether a leg may be flown is settled by the
+        voxel map, and a trail flown earlier may pass over cells still unseen
+        below it. A 级不按建筑没看到的格子检查：它们只用来引导规划；一段能不能飞由体素地图
+        决定，而且早先飞过的路线下方可能仍有没看到的格子。
+        """
+        if not self.survey.seen_free_only:
+            return limits
+        return dataclasses.replace(limits, no_fly=tuple(
+            z for z in limits.no_fly if getattr(z, 'name', '') != UNSEEN_HOUSE))
+
+    def _looked(self, at: Tuple[float, float, float], bearing: float) -> bool:
+        """Return whether the drone has already looked from here in this direction."""
+        return any(math.dist(p, at) < 0.5
+                   and abs((b - bearing + math.pi) % (2 * math.pi) - math.pi) < math.radians(10)
+                   for p, b in self._looks)
+
+    def _skip_station(self, stop: Stop, why: str, pose):
+        """Give up on a survey station and choose the next one from here."""
+        self.log(f'[house] skipping {stop.label}: {why}')
+        self._skipped_stations.append(tuple(stop.goal))
+        self._queue = []
+        # Count only the way actually gone round. 只计实际绕过的角度。
+        before, a0 = self._station_from
+        moved = (self._angle(pose) - a0 + math.pi) % (2 * math.pi) - math.pi
+        self.progress = before + max(moved, 0.0)
+        return self._survey_step(pose)
+
+    def _skip_photos(self, stop: Stop, why: str) -> None:
+        """Record the photos of a stop that cannot be reached as skipped."""
+        for a in stop.actions:
+            t = self.targets.pop(getattr(a, 'label', ''), None)
+            if t is None:
+                continue
+            self.skipped.append(Skipped(t.label, t.gutter, t.segment, t.start, t.end, why))
+            self.log(f'[house] skipping {t.label}: {why}')
+
+    def _way_home(self, end: Tuple[float, float, float], planner: Planner,
+                  flying: Optional[Sequence[Tuple[float, float, float]]] = None
+                  ) -> List[Tuple[float, float, float]]:
+        """
+        Return the way from end back above the takeoff point.
+
+        The planned way home if all of it has been seen free, otherwise (class
+        A, seen_free_only) back along the trail flown. flying: the points the
+        drone will have flown by end since the last decision (default: those of
+        the skills last given). 规划的回家路线全部确认为空时走它，否则（A 级）沿飞过的
+        路线原路返回。
+        """
+        route = route_home(planner, end, self.start)
+        if not self.survey.seen_free_only:
+            return route or []
+        if route is not None and reach(self._update_voxels(), end, route, self.explore)[1]:
+            return route
+        return back_along(self.trail + list(self._flying if flying is None else flying), end)
 
     def _in_the_way(self, here: Tuple[float, float, float], u: Tuple[float, float],
                     length: float) -> Optional[float]:
@@ -692,7 +938,7 @@ class HouseTask(GutterTask):
                     continue                     # rays show it empty down to the ground
                 cells[(int(np.floor((n - hm.origin[0]) / res)),
                        int(np.floor((e - hm.origin[1]) / res)))] = h
-        return HeightField(hm.origin, res, cells, 'house (not seen yet)')
+        return HeightField(hm.origin, res, cells, UNSEEN_HOUSE)
 
     def _update_free_space(self) -> None:
         rays = getattr(self.depth, 'rays', [])
@@ -754,7 +1000,7 @@ class HouseTask(GutterTask):
             alt = min(max(self.building_top + s.high_above_top, ground + s.low_altitude + 1.0),
                       lim.max_altitude)
         limits = self._survey_limits(hm)
-        planner = Planner(limits)
+        planner = Planner(limits, home=self.start)
         here = (pose[0], pose[1], pose[2])
         a0 = self._angle(here)
         # The very first station may be straight ahead; later ones must move on.
@@ -772,6 +1018,8 @@ class HouseTask(GutterTask):
             if (abs(u) < self.full_rect.length / 2 + keep_off
                     and abs(v) < self.full_rect.width / 2 + keep_off):
                 continue
+            if any(math.dist((n, e, alt), p) < 2.0 for p in self._skipped_stations):
+                continue                    # could not get there; 去不了的站点不再选
             d = (self._angle((n, e)) - a0) % (2 * math.pi)
             if d < min_step:
                 continue
@@ -791,12 +1039,18 @@ class HouseTask(GutterTask):
                 continue
             self.progress += d
             self.stations += 1
-            skills = [GoTo(*p) for p in route[:-1]]
-            skills += [GoTo(*goal, look_at=(round(face[0], 2), round(face[1], 2))),
-                       Scan(f'{self.ring} ring station {self.stations}'), Decide(SURVEY_STEP)]
-            skills += [GoTo(*p) for p in home] + [ReturnHome()]
+            face = (round(face[0], 2), round(face[1], 2))
+            label = f'{self.ring} ring station {self.stations}'
             note = (f'{self.ring} ring: station {self.stations}, '
                     f'{math.degrees(self.progress):.0f} deg round')
+            if s.seen_free_only:
+                self._station_from = (self.progress - d, a0)
+                self._queue = [Stop(goal, face, (Scan(label), Decide(SURVEY_STEP)), label)]
+                self._queue_kind = 'station'
+                return self._run_queue(pose, limits, note)
+            skills = [GoTo(*p) for p in route[:-1]]
+            skills += [GoTo(*goal, look_at=face), Scan(label), Decide(SURVEY_STEP)]
+            skills += [GoTo(*p) for p in home] + [ReturnHome()]
             self.decide_note = note
             return skills, limits, note
         # This ring is done (or nothing more is reachable). 这一圈完成。
@@ -885,6 +1139,9 @@ class HouseTask(GutterTask):
             self.log(f'[house] skipping {sk.label}: {sk.reason}')
         self.decide_note = (f'{len(targets)} gutter segment(s) to photograph'
                             + (f', {len(skipped)} skipped' if skipped else ''))
+        if self.survey.seen_free_only:
+            self._queue, self._queue_kind = stops_of(skills), 'inspect'
+            return self._run_queue(pose, limits, self.decide_note)
         return skills, limits, self.decide_note
 
     def _party_walls(self) -> List[Tuple[float, float]]:

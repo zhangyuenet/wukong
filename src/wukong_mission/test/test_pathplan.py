@@ -33,6 +33,17 @@ def test_straight_when_clear():
     assert p.path((0, 0, 4), (5, -3, 4)) == [(5, -3, 4)]
 
 
+def test_with_home_given_paths_keep_within_max_distance():
+    """check_plan rejects anything further than max_distance from home; so must the planner."""
+    lim = Limits(max_altitude=15, max_distance=25, max_skills=200, no_fly=(l_house(),))
+    start, goal = (5.0, 0.0, 4.0), (24.0, 0.0, 4.0)          # south side to north side
+    route = Planner(lim, home=(0.0, 0.0)).path(start, goal)
+    assert route is not None
+    assert all(math.hypot(n, e) <= 25.0 for n, e, _ in route)
+    assert Planner(lim, home=(0.0, 0.0)).path(start, (24.0, 8.0, 4.0)) is None    # 25.3 m out
+    assert Planner(lim).path(start, (24.0, 8.0, 4.0)) is not None                 # no home given
+
+
 def test_goes_around_the_house_and_passes_the_check():
     p = Planner(LIMITS)
     start, goal = (5.0, 0.0, 4.0), (24.0, 0.0, 4.0)          # south side to north side
