@@ -17,7 +17,7 @@ porch) come out the same way, so multi-storey houses need no special case.
 from collections import deque
 from dataclasses import dataclass, field
 import math
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -26,19 +26,29 @@ from .geometry import compass, Eave
 Cell = Tuple[int, int]
 
 
-def ground_height(z: np.ndarray, span: float = 1.5, bin_size: float = 0.05) -> float:
+def ground_height(z: np.ndarray, span: float = 1.5, bin_size: float = 0.05,
+                  spike: float = 4.0, default: float = 0.0) -> float:
     """
     Height of the ground: the peak of the height histogram near zero.
 
     The ground is one large flat surface, so it is by far the tallest peak;
     a median would be pulled up by the many wall points near the ground.
-    地面是一大片平面，在高度直方图中是最高的峰；用中位数会被墙面点拉高。
+    A peak counts only if it is a spike, spike times the mean bin: walls
+    spread their points evenly over the heights. Without one the ground is
+    not in view (a level camera 6 m up sees none within its 10 m range), and
+    default is returned: the ground where the drone took off, height 0.
+    地面是一大片平面，在高度直方图中是最高的峰；用中位数会被墙面点拉高。只有明显突出
+    （超过平均值 spike 倍）的峰才算地面，墙面的点在各个高度上分布均匀。没有这样的峰时，
+    说明没看到地面（水平的相机在 6 米高处、10 米量程内看不到地面），返回 default：
+    起飞点的地面，高度 0。
     """
     z = z[np.abs(z) < span]
     if len(z) < 20:
-        return 0.0
+        return default
     hist, edges = np.histogram(z, bins=np.arange(-span, span + bin_size, bin_size))
     k = int(np.argmax(hist))
+    if hist[k] < spike * hist[hist > 0].mean():
+        return default
     sel = z[(z >= edges[k]) & (z < edges[k + 1])]
     return float(np.median(sel))
 
@@ -190,9 +200,24 @@ def _gradient(top: np.ndarray, i: int, j: int, r: int) -> Optional[Tuple[float, 
     return -gi / m, -gj / m
 
 
-def edge_cells(hm: HeightMap, mask: np.ndarray, drop: float = 1.0,
-               min_height: float = 1.8) -> List[EdgeCell]:
-    """Find cells of the building where the roof ends in a drop of more than `drop` m."""
+def edge_cells(hm: HeightMap, mask: np.ndarray, drop: float = 1.0, min_height: float = 1.8,
+               clear_below: Optional[Callable[[float, float], float]] = None
+               ) -> List[EdgeCell]:
+    """
+    Find cells of the building where the roof ends in a drop of more than `drop` m.
+
+    The drop shows as lower cells just outside. clear_below(north, east), if
+    given, is the lowest height at which a depth ray crossed that point
+    unhindered (FreeSpace.ceiling_at): a cell with no points counts as lower
+    when a ray crossed it more than `drop` below the roof. With a 10 m depth
+    range the ground next to the walls is seldom in view, but the rays that
+    hit the walls pass there. This only finds where the roof ends; it says
+    nothing about what is above the ray, so it never clears a route
+    (docs/OBSTACLE_AVOIDANCE.md, L2). 屋面在外侧下降超过 drop 米处即为边缘。
+    clear_below 给出射线无阻穿过某点的最低高度：没有点的格子，若有射线在比屋面低
+    drop 米以上处穿过，也算作“更低”。10 米量程下墙根附近的地面很少能看到，但打到墙上的
+    射线会从那里穿过。这只用来判断屋面在哪里结束，不说明射线上方有什么，不能用来放行航线。
+    """
     top = hm.top
     out = []
     rows, cols = top.shape
@@ -211,6 +236,12 @@ def edge_cells(hm: HeightMap, mask: np.ndarray, drop: float = 1.0,
                     break
                 t = top[a, b]
                 if not np.isfinite(t):
+                    if clear_below is not None:
+                        n = hm.origin[0] + (a + 0.5) * hm.res
+                        e = hm.origin[1] + (b + 0.5) * hm.res
+                        if clear_below(n, e) - hm.ground_level < h - drop:
+                            lower = True           # a ray passed well below the roof
+                            break
                     continue                       # no data here: look further out
                 if t >= h - 0.3:
                     break                          # roof continues

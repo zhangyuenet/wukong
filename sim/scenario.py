@@ -10,6 +10,7 @@ Writes, for scenario <name>:
   world.sdf   Gazebo world (PX4 default world + the house, built inline)
   truth.json  ground truth: eave lines, gutter segments and their state
   map.yaml    what the drone is told: the house's rough position only
+  spawn_pose  where scripts/sim.sh puts the drone: x,y,z,roll,pitch,yaw (Gazebo)
 
 Frames: Gazebo world is ENU (x east, y north); PX4's local frame starts at the
 world origin, so local north = world y, local east = world x. Truth and map use
@@ -250,6 +251,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         model, truth, rough = buildings.build(cfg, name, out)
     else:                       # M2: one gabled house
         model, truth, rough = build(cfg, name)
+    # The way the drone is set down facing, a compass bearing (default north):
+    # the operator points it at the house, and discovery moves on that way when
+    # the house is out of depth range. Gazebo's yaw turns anticlockwise from
+    # east; scripts/sim.sh spawns the drone with spawn_pose.
+    # 起飞前机头朝向（罗盘方位，默认正北）：操作员把飞机朝着房屋放下，房屋超出有效深度
+    # 距离时，发现阶段朝这个方向前进。Gazebo 的偏航角自东起逆时针；sim.sh 按 spawn_pose
+    # 放置飞机。
+    facing = float(cfg.get('takeoff_facing_deg', 0.0))
+    truth['takeoff_facing_deg'] = facing
+    with open(os.path.join(out, 'spawn_pose'), 'w', encoding='utf-8') as f:
+        f.write(f'0,0,0,0,0,{math.radians(90.0 - facing):.4f}\n')
     world_name = f'wukong_{name}'
     with open(os.path.join(out, f'{world_name}.sdf'), 'w', encoding='utf-8') as f:
         f.write(world_sdf(world_name, model))

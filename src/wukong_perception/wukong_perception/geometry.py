@@ -22,6 +22,19 @@ import numpy as np
 # 相机安装位置：机体前方 0.132 米、上方 0.26 米，水平朝前。
 CAMERA_OFFSET_FRD = (0.132, 0.0, -0.26)
 
+# Effective depth range R (docs/OBSTACLE_AVOIDANCE.md section 3): readings
+# beyond it are dropped, as if nothing had returned. A real OAK-D Lite is not
+# reliable on leaves much beyond 10 m, and M4 is to work with 10 m. Not yet:
+# the M3 survey expects to see a whole building from one side, and with 10 m
+# it saw only the front 3 m of a 10 m deep townhouse row and put a station
+# over the unseen back eave. 18.5 m (just inside Gazebo's 19.1 m clip) until
+# the survey explores through seen-free space (M4, OBSTACLE_AVOIDANCE.md
+# section 9). 有效深度距离 R：超出的读数一律丢弃，当作没有回波。真实的 OAK-D Lite
+# 对 10 米外的树叶不可靠，M4 要在 10 米下工作。但现在还不行：M3 的扫描默认从一侧就能
+# 看到整栋建筑，10 米时只看到 10 米深联排的前 3 米，把一个站点排到了没看到的后檐上方。
+# 在扫描改为只穿过已确认为空的空间逐步探索之前，取 18.5 米。
+DEPTH_RANGE = 18.5
+
 COMPASS = ['north', 'northeast', 'east', 'southeast', 'south', 'southwest', 'west', 'northwest']
 
 
@@ -52,7 +65,7 @@ def body_to_ned(roll: float, pitch: float, yaw: float) -> np.ndarray:
 def depth_to_points(depth: np.ndarray, k: Intrinsics,
                     pose: Sequence[float],
                     offset_frd: Tuple[float, float, float] = CAMERA_OFFSET_FRD,
-                    stride: int = 4, max_range: float = 18.5) -> np.ndarray:
+                    stride: int = 4, max_range: float = DEPTH_RANGE) -> np.ndarray:
     """
     Convert a depth image to world points.
 
@@ -115,7 +128,7 @@ def project(points: np.ndarray, k: Intrinsics, pose: Sequence[float],
 
 def depth_rays(depth: np.ndarray, k: Intrinsics, pose: Sequence[float],
                offset_frd: Tuple[float, float, float] = CAMERA_OFFSET_FRD,
-               stride: int = 4, max_range: float = 18.5
+               stride: int = 4, max_range: float = DEPTH_RANGE
                ) -> Tuple[Tuple[float, float, float], np.ndarray, np.ndarray]:
     """
     Return the camera position and every sampled ray of a depth image.

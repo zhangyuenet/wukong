@@ -52,6 +52,9 @@ if [ -n "$SCENARIO" ]; then
     WORLD="wukong_$SCENARIO"
     python3 "$WUKONG_ROOT/sim/scenario.py" "$SCENARIO_FILE" >/dev/null
     ln -sf "$WUKONG_ROOT/sim/generated/$SCENARIO/$WORLD.sdf" "$PX4_WORLDS/$WORLD.sdf"
+    # Set the drone down facing the way the scenario says (towards the house).
+    # 按场景的设定放置飞机（机头朝向房屋）。
+    export PX4_GZ_MODEL_POSE="$(cat "$WUKONG_ROOT/sim/generated/$SCENARIO/spawn_pose")"
     echo "[sim] scenario $SCENARIO: map for the drone and ground truth in sim/generated/$SCENARIO/"
 elif [ -f "$WUKONG_ROOT/sim/worlds/$WORLD.sdf" ]; then
     ln -sf "$WUKONG_ROOT/sim/worlds/$WORLD.sdf" "$PX4_WORLDS/$WORLD.sdf"

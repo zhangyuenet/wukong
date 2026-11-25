@@ -8,7 +8,8 @@ import numpy as np
 import pytest
 
 from test_geometry import synthetic_house  # noqa: I100 - sibling test module
-from wukong_perception.heightmap import buildings, eave_lines, edge_cells, HeightMap
+from wukong_perception.heightmap import (buildings, eave_lines, edge_cells, ground_height,
+                                         HeightMap)
 
 
 def _eaves(points, takeoff=(0.0, 0.0)):
@@ -56,3 +57,29 @@ def test_two_levels_and_the_nearest_building():
     assert all(e.height > 5 for e in upper) and all(e.height < 3 for e in lower)
     # Nothing from the far house. 不包括远处的房屋。
     assert all(math.dist(e.point(0.5), (40, 30)) > 15 for e in eaves)
+
+
+def test_ground_out_of_view_is_the_takeoff_ground():
+    """Walls alone spread evenly over the heights: no spike, so the takeoff ground (0)."""
+    walls = _drop_ground(synthetic_house(step=0.1))
+    assert ground_height(walls[:, 2]) == 0.0
+    assert ground_height(walls[:, 2], default=-0.2) == -0.2
+    raised = synthetic_house(step=0.1) + np.array([0.0, 0.0, 0.4])   # ground in view, at 0.4
+    assert ground_height(raised[:, 2]) == pytest.approx(0.4, abs=0.06)
+
+
+def test_rays_below_the_roof_edge_stand_in_for_unseen_ground():
+    """With no ground in view, eaves are found only where rays passed well below the roof."""
+    # A few points far off: the grid reaches past the roof, as in flight, so the
+    # cells outside the eaves are unseen rather than off the map.
+    # 远处几个点，让栅格超出屋面（与飞行中一样），屋檐外的格子是“没看到”而不是“出界”。
+    corners = [(0.0, -12.0, 0.0), (0.0, 12.0, 0.0), (30.0, -12.0, 0.0), (30.0, 12.0, 0.0)]
+    pts = np.vstack([_drop_ground(synthetic_house(step=0.1)), corners])
+    hm = HeightMap.from_points(pts, res=0.2)
+    target = buildings(hm, (0.0, 0.0))[0]
+    assert eave_lines(hm, edge_cells(hm, target.cells)) == []
+    low = eave_lines(hm, edge_cells(hm, target.cells, clear_below=lambda n, e: 1.0))
+    assert sorted(e.name for e in low) == ['north gutter', 'south gutter']
+    # Rays only above the roof say nothing about where it ends. 只从屋面上方经过的射线不算。
+    high = eave_lines(hm, edge_cells(hm, target.cells, clear_below=lambda n, e: 9.0))
+    assert high == []

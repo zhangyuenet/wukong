@@ -18,6 +18,7 @@ From one sentence to a landed drone and a report.
 import argparse
 from concurrent.futures import Future, ThreadPoolExecutor
 import functools
+import math
 import os
 import sys
 import time
@@ -119,8 +120,8 @@ def _parse_args(argv):
     return args
 
 
-def _wait_for_vehicle(timeout: float = 15.0) -> Optional[Tuple[float, float]]:
-    """Return the current (north, east) in PX4's local frame, or None if PX4 is not there."""
+def _wait_for_vehicle(timeout: float = 15.0) -> Optional[Tuple[float, float, float]]:
+    """Return (north, east, heading) in PX4's local frame, or None if PX4 is not there."""
     node = Node('run_task_probe')
     link = Px4Link(node)
     end = time.monotonic() + timeout
@@ -129,7 +130,7 @@ def _wait_for_vehicle(timeout: float = 15.0) -> Optional[Tuple[float, float]]:
             rclpy.spin_once(node, timeout_sec=0.1)
             s = link.state()
             if s.connected and s.position_valid:
-                return s.x, s.y
+                return s.x, s.y, s.heading
         return None
     finally:
         node.destroy_node()
@@ -147,7 +148,7 @@ def _collect(futures: List[Tuple[str, str, Future]], timeout: float) -> List[Ver
     return verdicts
 
 
-def _run_gutters(args, world, start, out_dir, say) -> int:
+def _run_gutters(args, world, start, facing, out_dir, say) -> int:
     """M2: survey a roughly known house, then photograph and judge every gutter segment."""
     try:
         if args.offline:
@@ -158,7 +159,8 @@ def _run_gutters(args, world, start, out_dir, say) -> int:
         say(f'[run_task] understanding: "{args.instruction}"')
         request = planner.request(args.instruction)
         if world.find_house:       # M3: find the nearest building in flight
-            task = HouseTask(world, request, start, out_dir, judge, args.instruction, log=say)
+            task = HouseTask(world, request, start, out_dir, judge, args.instruction, log=say,
+                             facing=facing)
             if not args.offline:   # judge the kind of house from a photo 根据照片判断房屋类型
                 task.classifier = ClaudeClassifier(args.model)
             else:                  # sim only: the scenario's truth stands in for Claude
@@ -260,13 +262,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
     try:
         # 1. Where are we? 读取飞机位置。
-        start = _wait_for_vehicle()
-        if start is None:
+        found = _wait_for_vehicle()
+        if found is None:
             say('[run_task] no vehicle position from PX4 (is ./scripts/sim.sh running?)')
             return 2
-        say(f'[run_task] drone at north {start[0]:.1f}, east {start[1]:.1f}')
+        start, facing = found[:2], found[2]
+        say(f'[run_task] drone at north {start[0]:.1f}, east {start[1]:.1f}, '
+            f'facing {math.degrees(facing) % 360:.0f} deg')
         if world.rough_houses or world.find_house:
-            return _run_gutters(args, world, start, out_dir, say)
+            return _run_gutters(args, world, start, facing, out_dir, say)
 
         # 2. Plan, on the ground. 在地面上完成规划。
         try:

@@ -5,7 +5,9 @@ M3 gutter inspection: find the nearest building, survey it in layers, inspect ev
 
 The map gives no house: only limits and a search radius. In flight (callbacks
 from MissionNode, decisions in a worker thread):
-  1. discovery: climb above the takeoff point, scan all around       -> Decide
+  1. discovery: climb above the takeoff point, scan all around; if no
+     building is within depth range, move on the way the drone faced on
+     the ground and scan again                                        -> Decide
   2. survey, one station at a time: after every scan, refit the building
      and choose only the next station along the ring (high ring first: the
      far side is first visited high and far off, and seen from above before
@@ -17,8 +19,8 @@ side is visible, so a ring planned from it could put far-side stations inside
 the unseen part of the house. Facing the building at every station, the drone
 sees how far it extends before going there.
 逐站规划：起飞点只能看到房屋的近侧，一次排好整圈站点可能让远侧站点落进没看到的部分。
-M3 水槽检查：地图不给房屋。起飞后环视找到最近的建筑，分两层环绕扫描，
-再识别所有楼层的屋檐并逐段拍照。
+M3 水槽检查：地图不给房屋。起飞后环视找到最近的建筑（有效深度距离内没有建筑时，
+沿起飞前机头的朝向前进再看），分两层环绕扫描，再识别所有楼层的屋檐并逐段拍照。
 """
 
 import dataclasses
@@ -31,7 +33,7 @@ from typing import Callable, List, Optional, Sequence, Tuple
 import numpy as np
 from wukong_flight.skills import (Decide, GoTo, HeightField, Limits, ReturnHome, Scan, Skill,
                                   Takeoff, TakePhoto)
-from wukong_perception.geometry import Eave, merge
+from wukong_perception.geometry import DEPTH_RANGE, Eave, merge
 from wukong_perception.heightmap import (building_rectangle, buildings, eave_lines, edge_cells,
                                          FreeSpace, ground_height, HeightMap, Rectangle)
 from wukong_perception.register import merge_registered, register_scans
@@ -43,6 +45,8 @@ from .pathplan import Planner, route_home
 from .world import WorldMap
 
 DISCOVERY = 'discovery'
+LOOK_AROUND = 'look around'        # scan labels of the discovery phase
+LOOK_AHEAD = 'look ahead'
 CLASSIFY = 'what kind of house'
 OVERVIEW = 'house overview'
 SURVEY_STEP = 'survey step'
@@ -52,6 +56,15 @@ SURVEY_STEP = 'survey step'
 class SurveyConfig:
     discovery_altitude: float = 6.0     # m above the takeoff point, climbing straight up
     discovery_headings: int = 8
+    # The look-around sees only DEPTH_RANGE metres. When it finds no building,
+    # move on in steps the way the drone faced on the ground (the operator sets
+    # it down facing the house) and scan again, as long as nothing was seen in
+    # the way: no depth point within advance_step + advance_clearance ahead.
+    # 环视只能看到有效深度距离以内。找不到建筑时，沿起飞前机头的朝向（操作员把飞机
+    # 朝着房屋放下）逐步前进再扫描；前方 advance_step + advance_clearance 以内看到
+    # 任何深度点就不再前进。
+    advance_step: float = 3.0
+    advance_clearance: float = 4.0
     min_building_height: float = 2.5    # m; lower things (cars, fences) are not houses
     min_building_area: float = 20.0     # m^2
     low_offset: float = 7.0             # m out from the outline, low ring
@@ -168,11 +181,16 @@ class HouseTask(GutterTask):
                  out_dir: str, judge: Judge, instruction: str,
                  cfg: InspectionConfig = InspectionConfig(),
                  survey: SurveyConfig = SurveyConfig(),
-                 log: Callable[[str], None] = print) -> None:
+                 log: Callable[[str], None] = print, facing: float = 0.0) -> None:
         # Not GutterTask.__init__: there is no rough house on this map.
+        # facing: the drone's heading on the ground (radians from north), the
+        # way discovery moves on when the house is out of depth range.
+        # facing：起飞前的机头朝向（自北起算的弧度），环视看不到房屋时朝这个方向前进。
         from concurrent.futures import ThreadPoolExecutor
         import threading
         self.world, self.request, self.start = world, request, start
+        self.facing = facing
+        self.advances = 0              # discovery steps taken towards the house
         self.out_dir, self.judge, self.instruction = out_dir, judge, instruction
         self.cfg, self.survey, self.log = cfg, survey, log
         self.depth = None
@@ -221,7 +239,7 @@ class HouseTask(GutterTask):
         for k in range(s.discovery_headings):
             b = 2 * math.pi * k / s.discovery_headings
             look = (round(n0 + 10 * math.cos(b), 2), round(e0 + 10 * math.sin(b), 2))
-            skills += [GoTo(n0, e0, alt, look_at=look), Scan(f'look around {k + 1}')]
+            skills += [GoTo(n0, e0, alt, look_at=look), Scan(f'{LOOK_AROUND} {k + 1}')]
         return skills + [Decide(DISCOVERY), ReturnHome()]
 
     # -- in flight -----------------------------------------------------------------------
@@ -251,7 +269,8 @@ class HouseTask(GutterTask):
         ground = None
         if survey_only:
             labels = list(getattr(self.depth, 'labels', []))
-            kept = [c for c, lab in zip(clouds, labels) if not str(lab).startswith('look around')]
+            kept = [c for c, lab in zip(clouds, labels)
+                    if not str(lab).startswith((LOOK_AROUND, LOOK_AHEAD))]
             if len(kept) >= 4:
                 everything = merged(clouds)
                 if everything is not None:
@@ -286,6 +305,9 @@ class HouseTask(GutterTask):
                  if b.distance <= self.world.search_radius]
         if not found:
             self.decide_note = f'no building within {self.world.search_radius:g} m'
+            step = self._advance(pose)          # may say why it cannot move on
+            if step is not None:
+                return step
             return None, None, self.decide_note
         target = found[0]
         self._update_building(hm, target)
@@ -305,6 +327,53 @@ class HouseTask(GutterTask):
         home = route_home(planner, here, self.start) or []
         return (skills + [GoTo(*p) for p in home] + [ReturnHome()], self._survey_limits(hm),
                 'photographing the house to judge what kind it is')
+
+    def _advance(self, pose):
+        """
+        Move one step on towards the house, scan, and decide again; None if not allowed.
+
+        Straight on from the takeoff point the way the drone faced on the ground,
+        at the discovery altitude, the depth camera facing the way it moves. Not
+        past search_radius - DEPTH_RANGE (the scans then reach search_radius), and
+        not if any depth point lies in the corridor ahead: whatever it is, the
+        drone does not fly towards it blind. 沿起飞时的朝向直线前进一步，深度相机朝前。
+        最远到 search_radius - DEPTH_RANGE（扫描正好覆盖到搜索半径）；前方走廊里有任何
+        深度点就不前进：不管那是什么，都不盲目飞过去。
+        """
+        s = self.survey
+        u = (math.cos(self.facing), math.sin(self.facing))
+        here = (pose[0], pose[1], pose[2])
+        done = (here[0] - self.start[0]) * u[0] + (here[1] - self.start[1]) * u[1]
+        reach = done + s.advance_step
+        if reach > self.world.search_radius - DEPTH_RANGE + 1e-6:
+            return None
+        ahead = self._in_the_way(here, u, s.advance_step + s.advance_clearance)
+        if ahead is not None:
+            self.decide_note = (f'no building within {DEPTH_RANGE:g} m, and something '
+                                f'{ahead:.1f} m ahead: not moving on towards it')
+            return None
+        nxt = (round(self.start[0] + reach * u[0], 2), round(self.start[1] + reach * u[1], 2),
+               round(here[2], 2))
+        look = (round(nxt[0] + 10 * u[0], 2), round(nxt[1] + 10 * u[1], 2))
+        self.advances += 1
+        note = f'no building within {DEPTH_RANGE:g} m: moving {reach:.0f} m on to look again'
+        self.decide_note = note
+        skills = [GoTo(*nxt, look_at=look), Scan(f'{LOOK_AHEAD} {self.advances}'),
+                  Decide(DISCOVERY), ReturnHome()]
+        return skills, self.world.limits, note
+
+    def _in_the_way(self, here: Tuple[float, float, float], u: Tuple[float, float],
+                    length: float) -> Optional[float]:
+        """Return how far ahead along u the nearest depth point in the corridor is, or None."""
+        pts = merge(list(self.depth.clouds)) if self.depth else None
+        if pts is None:
+            return None
+        rel = pts - np.array(here)
+        along = rel[:, 0] * u[0] + rel[:, 1] * u[1]
+        side = np.abs(-rel[:, 0] * u[1] + rel[:, 1] * u[0])
+        half = self.world.limits.margin + 1.0
+        near = (along > 0) & (along < length) & (side < half) & (np.abs(rel[:, 2]) < half)
+        return float(along[near].min()) if near.any() else None
 
     def _front_point(self, keep_in: float = 3.0) -> Tuple[float, float]:
         """
@@ -704,6 +773,12 @@ class HouseTask(GutterTask):
         if target is None:
             self.decide_note = 'the building was lost after the survey'
             return None, None, self.decide_note
+        # No clear_below here: with the depth range at 18.5 m the ground beside the
+        # walls is in view, and in Gazebo the rays' evidence cut row_end's east
+        # eave 1.4 m short at a hip corner. It comes back with the 10 m range,
+        # from the voxel map. 这里不用 clear_below：18.5 米量程下墙根的地面看得到；在
+        # Gazebo 中射线依据让 row_end 的东侧屋檐在戗角处短了 1.4 米。切到 10 米时改用
+        # 体素地图的依据再加回来。
         eaves = eave_lines(hm, edge_cells(hm, target.cells))
         if self.is_row:
             # Outside the survey window the row was only glimpsed past the target

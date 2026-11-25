@@ -4,13 +4,15 @@
 
 import math
 
+import numpy as np
 import pytest
 from wukong_flight.skills import Decide, GoTo, ReturnHome, Scan, Takeoff
 from wukong_mission.gutter_task import GutterRequest
-from wukong_mission.house_task import clip_to_window, HouseTask, ring_stations
+from wukong_mission.house_task import (clip_to_window, DISCOVERY, HouseTask, LOOK_AHEAD,
+                                       ring_stations)
 from wukong_mission.judge import FakeJudge
 from wukong_mission.world import WorldMap
-from wukong_perception.geometry import Eave
+from wukong_perception.geometry import DEPTH_RANGE, Eave
 from wukong_perception.heightmap import Rectangle
 from wukong_flight.skills import Limits  # noqa: I100
 
@@ -230,3 +232,53 @@ def test_photos_along_a_row_know_the_home_and_their_claim():
     assert [*b.claim[0], *b.claim[1]] == pytest.approx([11.0, 1.4, 11.0, 3.25])
     assert c.home is None and c.claim is None                          # across the row
     assert a.walls == (True, True) and b.walls == (True, True)
+
+
+class _Scans:
+    """Stands in for DepthCamera: the clouds discovery has seen."""
+
+    def __init__(self, *clouds):
+        self.clouds = [np.asarray(c, float) for c in clouds]
+        self.labels = [f'look around {k + 1}' for k in range(len(self.clouds))]
+        self.rays = []
+
+
+def _open_ground(center=(0.0, 0.0), radius=9.0):
+    """Return a ring of ground points around center: nothing taller in view."""
+    a = np.linspace(0, 2 * math.pi, 400)
+    r = np.repeat([radius - 1.0, radius], 200)
+    return np.column_stack([center[0] + r * np.cos(a), center[1] + r * np.sin(a), 0.0 * a])
+
+
+def test_discovery_moves_on_the_way_it_faced_on_the_ground():
+    """Nothing within depth range: step on (east here) until the scans reach search_radius."""
+    t = HouseTask(world(), GutterRequest('x', 'nearest', []), (1.0, 2.0), '/tmp', FakeJudge(),
+                  'x', facing=math.pi / 2)
+    t.depth = _Scans(_open_ground((1.0, 2.0)))
+    pose = (1.0, 2.0, 6.0, 0.0)
+    steps = []
+    while True:
+        skills, limits, note = t.on_decide(DISCOVERY, pose)
+        if skills is None:
+            break
+        go, scan, decide = skills[:3]
+        assert isinstance(scan, Scan) and scan.label.startswith(LOOK_AHEAD)
+        assert isinstance(decide, Decide) and isinstance(skills[-1], ReturnHome)
+        assert go.look_at[0] == pytest.approx(go.north) and go.look_at[1] > go.east  # facing east
+        pose = (go.north, go.east, go.altitude, math.pi / 2)
+        steps.append((go.north, go.east, go.altitude))
+    reach = t.world.search_radius - DEPTH_RANGE
+    assert steps and all(s[0] == 1.0 and s[2] == 6.0 for s in steps)
+    assert [s[1] - 2.0 for s in steps] == pytest.approx(
+        [3.0 * k for k in range(1, int(reach // 3.0) + 1)])
+    assert note == 'no building within 30 m'
+
+
+def test_discovery_does_not_move_on_towards_something_in_the_way():
+    t = HouseTask(world(), GutterRequest('x', 'nearest', []), (0.0, 0.0), '/tmp', FakeJudge(),
+                  'x', facing=0.0)
+    pole = [(5.0, 0.2, z) for z in np.arange(0.0, 8.0, 0.05)]     # 5 m north, too thin for a house
+    t.depth = _Scans(_open_ground(), pole)
+    skills, _, note = t.on_decide(DISCOVERY, (0.0, 0.0, 6.0, 0.0))
+    assert skills is None
+    assert 'something 5.0 m ahead' in note

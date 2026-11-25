@@ -117,7 +117,7 @@ def fly(task: HouseTask, plan: List[Skill], start: Tuple[float, float], limits: 
         tris: Optional[np.ndarray] = None) -> Tuple[List[str], List[str], int]:
     """Execute a plan with an ideal vehicle; returns (photos, problems, scans)."""
     pos = (start[0], start[1], 0.0)
-    heading = 0.0
+    heading = task.facing
     photos, problems, scans = [], [], 0
     i = 0
     while i < len(plan):
@@ -205,7 +205,8 @@ def check(name: str, verbose: bool = False, drift: float = 0.0, register: bool =
     out = tempfile.mkdtemp(prefix=f'mission_{name}_')
     start = (0.0, 0.0)
     task = HouseTask(world, GutterRequest('all gutters', 'nearest', []), start, out,
-                     FakeJudge(), 'check all gutters', log=lambda m: print('  ', m))
+                     FakeJudge(), 'check all gutters', log=lambda m: print('  ', m),
+                     facing=math.radians(truth.get('takeoff_facing_deg', 0.0)))
     task.depth = RayCastDepth(tris, drift)
     if classify and 'buildings' in truth:
         task.classifier = TruthClassifier(truth)
