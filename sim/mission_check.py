@@ -218,18 +218,17 @@ def check(name: str, verbose: bool = False, drift: float = 0.0, register: bool =
     gen = os.path.join(HERE, 'generated', name)
     truth = json.load(open(os.path.join(gen, 'truth.json')))
     world = load_world(os.path.join(gen, 'map.yaml'))
-    if not world.find_house:      # an M2 map: run the M3 flow on it anyway
-        import dataclasses
-        world = dataclasses.replace(world, rough_houses=(), search_radius=30.0,
-                                    limits=dataclasses.replace(world.limits, no_fly=()))
     tris = raycast.load_triangles(os.path.join(gen, f'wukong_{name}.sdf'))
     out = tempfile.mkdtemp(prefix=f'mission_{name}_')
     start = (0.0, 0.0)
-    task = HouseTask(world, GutterRequest('all gutters', 'nearest', []), start, out,
+    # An M2 map names its house (a rough position); an M3 map none.
+    # M2 的地图给出房屋名和大概位置；M3 的地图不给。
+    house = world.rough_houses[0].name if world.rough_houses else 'nearest'
+    task = HouseTask(world, GutterRequest('all gutters', house, []), start, out,
                      FakeJudge(), 'check all gutters', log=lambda m: print('  ', m),
                      facing=math.radians(truth.get('takeoff_facing_deg', 0.0)))
     task.depth = RayCastDepth(tris, drift)
-    if classify and 'buildings' in truth:
+    if classify:
         task.classifier = TruthClassifier(truth)
     task.register = register
     if seen_free:

@@ -6,13 +6,14 @@ import math
 
 import numpy as np
 import pytest
-from wukong_flight.skills import Decide, GoTo, HeightField, ReturnHome, Scan, Takeoff, TakePhoto
+from wukong_flight.skills import (check_plan, Decide, GoTo, HeightField, ReturnHome, Scan,
+                                  Takeoff, TakePhoto)
 from wukong_mission.explore import Stop
 from wukong_mission.gutter_task import GutterRequest
 from wukong_mission.house_task import (clip_to_window, CONTINUE, DISCOVERY, HouseTask, LOOK_AHEAD,
                                        ring_stations)
 from wukong_mission.judge import FakeJudge
-from wukong_mission.world import WorldMap
+from wukong_mission.world import RoughHouse, WorldMap
 from wukong_perception.geometry import DEPTH_RANGE, Eave
 from wukong_perception.heightmap import Rectangle
 from wukong_flight.skills import Limits  # noqa: I100
@@ -306,6 +307,89 @@ def test_discovery_does_not_move_on_where_it_has_not_seen(frames):
     skills, _, note = t.on_decide(DISCOVERY, (0.0, 0.0, 6.0, 0.0))
     assert skills is None
     assert 'seen free for only' in note
+
+
+def _hinted(center, radius, max_height=7.0):
+    """Return an M2 map: one house known only to lie within radius of center."""
+    rough = RoughHouse('house', center, radius, max_height)
+    return WorldMap('test', (), Limits(max_altitude=15, max_distance=45, no_fly=(rough.zone(),)),
+                    69, 42, rough_houses=(rough,))
+
+
+def _block(center, size, height, step=0.1):
+    """Return points over a flat roof: what scans see of a box-shaped building from above."""
+    n, e = np.meshgrid(np.arange(-size[0] / 2, size[0] / 2, step),
+                       np.arange(-size[1] / 2, size[1] / 2, step))
+    return np.column_stack([center[0] + n.ravel(), center[1] + e.ravel(),
+                            np.full(n.size, height)])
+
+
+def test_with_a_rough_position_discovery_takes_the_building_there():
+    """Not the nearest building: the one in the map's circle, even with another nearer."""
+    t = HouseTask(_hinted((1.0, 14.0), 7.0), GutterRequest('x', 'house', []), (0.0, 0.0),
+                  '/tmp', FakeJudge(), 'x', facing=0.0)
+    assert t.facing == pytest.approx(math.atan2(14.0, 1.0))      # moves on towards it
+    shed = _block((8.0, 0.0), (6.0, 6.0), 4.0)                    # nearer, outside the circle
+    house = _block((0.0, 15.0), (8.0, 8.0), 5.0)
+    t.depth = _Scans(_open_ground(radius=20.0), shed, house)
+    skills, _, note = t.on_decide(DISCOVERY, (0.0, 0.0, 6.0, 0.0))
+    assert skills is None and 'no way to judge' in note           # no classifier here
+    assert t.rect.center[0] == pytest.approx(0.0, abs=0.5)
+    assert t.rect.center[1] == pytest.approx(15.0, abs=0.5)
+    # Its unseen cells are as tall as the map says this house is at most.
+    # 它没看到的格子按地图给出的这栋房屋的最高高度禁飞。
+    unknown = t._unknown_cells(t._heightmap(), 0.5)
+    assert unknown.cells and max(unknown.cells.values()) <= 7.0 + 1e-6
+
+
+def test_with_a_rough_position_discovery_moves_on_towards_it_short_of_its_circle():
+    """Out of depth range: step on towards the circle, but not into it or its margin."""
+    world = _hinted((0.0, 32.0), 10.0)
+    t = HouseTask(world, GutterRequest('x', 'house', []), (0.0, 0.0), '/tmp', FakeJudge(), 'x',
+                  facing=0.0)                                     # faced north on the ground
+    t.depth = _Scans(_open_ground(), rays=_look_around((0.0, 0.0, 6.0)))
+    pose = (0.0, 0.0, 6.0, 0.0)
+    steps = []
+    while True:
+        skills, limits, note = t.on_decide(DISCOVERY, pose)
+        if skills is None:
+            break
+        assert check_plan(skills, limits, initial=pose[:3]).ok, note
+        go = skills[0]
+        pose = (go.north, go.east, go.altitude, math.pi / 2)
+        steps.append(go.east)
+        assert go.north == pytest.approx(0.0)                     # east, towards the circle
+        t.depth.rays.append(_frame(pose[:3], math.pi / 2))
+    # The circle's edge is 22 m away; 2 m margin and 0.5 m to spare.
+    # 圆的边缘在 22 米处，留出 2 米安全距离和 0.5 米余量。
+    assert steps == pytest.approx([3.0, 6.0, 9.0, 12.0, 15.0, 18.0, 19.5])
+    assert note == 'no building seen yet within 10 m of the rough position (0.0, 32.0) ' \
+        '(12.5 m away)'
+
+
+@pytest.mark.parametrize('start, height, alt', [
+    ((0.0, 0.0), 5.0, 10.0 * math.tan(math.radians(19.0))),         # lower than the drone
+    ((0.0, 0.0), 8.0, 6.0),                                        # seen face on already
+    ((0.0, 3.0), 5.0, 6.0),                                        # outside the open column
+])
+def test_the_overview_of_a_low_house_is_taken_from_lower_down(start, height, alt):
+    """Its whole front in the picture: the bottom edge meets the ground 1 m in front of it."""
+    t = HouseTask(_hinted((1.0, 14.0), 7.0, max_height=9.0), GutterRequest('x', 'house', []),
+                  (0.0, 0.0), '/tmp', FakeJudge(), 'x')
+    t.classifier = _Classifier()
+    t.depth = _Scans(_open_ground(radius=20.0), _block((0.0, 15.0), (8.0, 8.0), height))
+    skills, limits, _ = t.on_decide(DISCOVERY, (*start, 6.0, 0.0))
+    go, photo, decide = skills[:3]
+    assert isinstance(photo, TakePhoto) and isinstance(decide, Decide)
+    assert (go.north, go.east) == start
+    assert go.altitude == pytest.approx(alt, abs=0.1)
+    assert check_plan(skills, limits, initial=(*start, 6.0)).ok
+
+
+def test_a_house_not_on_the_map_is_refused_before_takeoff():
+    with pytest.raises(ValueError, match='no house "garage"'):
+        HouseTask(_hinted((1.0, 14.0), 7.0), GutterRequest('x', 'garage', []), (0.0, 0.0),
+                  '/tmp', FakeJudge(), 'x')
 
 
 def test_discovery_does_not_move_on_towards_something_in_the_way():

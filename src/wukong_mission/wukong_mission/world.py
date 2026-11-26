@@ -52,9 +52,11 @@ class RoughHouse:
     """
     A house known only roughly: somewhere within radius of approx_center.
 
-    Its exact shape comes from perception in flight (M2). Until then the whole
-    circle, up to max_height, is a no-fly zone.
-    只知道大概位置的房屋：精确形状在飞行中由感知得到，之前整个圆柱都是禁飞区。
+    Its exact shape comes from perception in flight: the drone takes the
+    building it finds in this circle. Until then the whole circle, up to
+    max_height, is a no-fly zone.
+    只知道大概位置的房屋：飞行中取在这个圆内找到的建筑，精确形状由感知得到；
+    之前整个圆柱都是禁飞区。
     """
 
     name: str
@@ -103,8 +105,9 @@ class WorldMap:
                              f'midpoint {g.midpoint}.')
         for r in self.rough_houses:
             lines.append(f'- {r.name}: exact shape unknown; it lies within {r.radius:g} m of '
-                         f'{r.approx_center} and is at most {r.max_height:g} m tall. Its shape '
-                         f'and gutters are measured in flight by the survey_house skill.')
+                         f'{r.approx_center} and is at most {r.max_height:g} m tall. In flight '
+                         f'the drone finds it there and measures its shape and gutters, and '
+                         f'can tell which compass direction each gutter faces.')
         if self.find_house:
             lines.append(f'No house positions are known. In flight the drone looks around from '
                          f'above the takeoff point and inspects the building nearest to it '

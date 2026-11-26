@@ -2,9 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """House-kind judgement: the ruler, its readings, and which side faces the drone."""
 
+import json
+
 from PIL import Image
 import pytest
-from wukong_mission.classify import annotate, from_answer, front_of, HouseKind
+from wukong_mission.classify import annotate, from_answer, front_of, HouseKind, TruthClassifier
 from wukong_perception.heightmap import Rectangle
 
 
@@ -46,3 +48,14 @@ def test_annotate_draws_on_the_photo(tmp_path):
                  for y in range(540, 1080, 4) if img.getpixel((x, y))[2] < 80
                  and img.getpixel((x, y))[0] > 200 and img.getpixel((x, y))[1] > 180)
     assert yellow > 50                                  # the ruler, below the horizon
+
+
+def test_offline_truth_of_an_m2_scenario_is_a_single_storey_house(tmp_path):
+    """An M2 scenario's truth has one house, no buildings list: still judged, as detached."""
+    (tmp_path / 'truth.json').write_text(json.dumps({'house': {'center': [15.0, 0.0]},
+                                                     'gutters': []}))
+    c = TruthClassifier.beside(str(tmp_path / 'map.yaml'))
+    assert c is not None
+    answer = c.classify_house('', (0.0, 0.0, 6.0, 0.0, 0.0, 0.0), ((0, 0), (1, 0)), 1.0, '')
+    assert (answer.kind, answer.storeys, answer.confidence) == ('detached', 1, 'high')
+    assert TruthClassifier.beside(str(tmp_path / 'nowhere' / 'map.yaml')) is None

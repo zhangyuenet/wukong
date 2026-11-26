@@ -210,7 +210,7 @@ class TruthClassifier:
             return None
         with open(path) as f:
             truth = json.load(f)
-        return cls(truth) if 'buildings' in truth else None
+        return cls(truth) if 'buildings' in truth or 'house' in truth else None
 
     def classify_house(self, photo: str, pose: Sequence[float], front: Tuple[Point, Point],
                        height: float, out_dir: str) -> 'Classification':
@@ -224,5 +224,6 @@ class TruthClassifier:
                                       tuple(u['to'])), end, 'high', 'from the truth', 'truth')
             return Classification('detached', 2, 'attached', None, None, 'high',
                                   'from the truth', 'truth')
+        # An M2 scenario: one single-storey house. M2 场景：一栋单层房屋。
         return Classification('detached', 1, 'none', None, None, 'high', 'from the truth',
                               'truth')

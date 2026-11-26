@@ -3,11 +3,14 @@
 """
 M3 gutter inspection: find the nearest building, survey it in layers, inspect every eave.
 
-The map gives no house: only limits and a search radius. In flight (callbacks
-from MissionNode, decisions in a worker thread):
-  1. discovery: climb above the takeoff point, scan all around; if no
-     building is within depth range, move on the way the drone faced on
-     the ground and scan again                                        -> Decide
+The map gives no house, or only roughly where it is (a circle sure to contain
+it, M2's maps). In flight (callbacks from MissionNode, decisions in a worker
+thread):
+  1. discovery: climb above the takeoff point, scan all around, take the
+     building nearest the takeoff point (or, given a rough position, the one
+     in that circle nearest its centre); if there is none within depth
+     range, move on the way the drone faced on the ground (towards the
+     rough position) and scan again                                   -> Decide
   2. survey, one station at a time: after every scan, refit the building
      and choose only the next station along the ring (high ring first: the
      far side is first visited high and far off, and seen from above before
@@ -19,8 +22,9 @@ side is visible, so a ring planned from it could put far-side stations inside
 the unseen part of the house. Facing the building at every station, the drone
 sees how far it extends before going there.
 逐站规划：起飞点只能看到房屋的近侧，一次排好整圈站点可能让远侧站点落进没看到的部分。
-M3 水槽检查：地图不给房屋。起飞后环视找到最近的建筑（有效深度距离内没有建筑时，
-沿起飞前机头的朝向前进再看），分两层环绕扫描，再识别所有楼层的屋檐并逐段拍照。
+M3 水槽检查：地图不给房屋，或只给大概位置（一定包住房屋的圆，M2 的地图）。起飞后环视，
+取离起飞点最近的建筑（给了大概位置时，取圆内离圆心最近的建筑；有效深度距离内没有时，
+沿起飞前机头的朝向、或朝大概位置前进再看），分两层环绕扫描，再识别所有楼层的屋檐并逐段拍照。
 """
 
 import dataclasses
@@ -46,7 +50,7 @@ from .inspection import (InspectionConfig, plan_inspection, Skipped,
                          surfaces_from_heightmap)
 from .judge import Judge
 from .pathplan import Planner, route_home
-from .world import WorldMap
+from .world import RoughHouse, WorldMap
 
 DISCOVERY = 'discovery'
 LOOK_AROUND = 'look around'        # scan labels of the discovery phase
@@ -162,6 +166,13 @@ def _heading_after(legs: Sequence[GoTo], heading: float) -> float:
     return heading
 
 
+def _distance_to(hm: HeightMap, cells: np.ndarray, p: Sequence[float]) -> float:
+    """Return the horizontal distance from p to the nearest of the height map's cells."""
+    idx = np.argwhere(cells)
+    return float(np.min(np.hypot(hm.origin[0] + (idx[:, 0] + 0.5) * hm.res - p[0],
+                                 hm.origin[1] + (idx[:, 1] + 0.5) * hm.res - p[1])))
+
+
 def _long_axis(r: Rectangle) -> Rectangle:
     """Return the same rectangle with u along its longer side (a row's long axis)."""
     if r.width > r.length:
@@ -215,13 +226,24 @@ class HouseTask(GutterTask):
                  cfg: InspectionConfig = InspectionConfig(),
                  survey: SurveyConfig = SurveyConfig(),
                  log: Callable[[str], None] = print, facing: float = 0.0) -> None:
-        # Not GutterTask.__init__: there is no rough house on this map.
+        # Not GutterTask.__init__: that flies M2's survey round the rough house.
         # facing: the drone's heading on the ground (radians from north), the
-        # way discovery moves on when the house is out of depth range.
-        # facing：起飞前的机头朝向（自北起算的弧度），环视看不到房屋时朝这个方向前进。
+        # way discovery moves on when the house is out of depth range; given a
+        # rough position, it moves on towards that instead.
+        # facing：起飞前的机头朝向（自北起算的弧度），环视看不到房屋时朝这个方向前进；
+        # 地图给了大概位置时改为朝大概位置前进。
         from concurrent.futures import ThreadPoolExecutor
         import threading
         self.world, self.request, self.start = world, request, start
+        self.hint: Optional[RoughHouse] = None
+        if world.rough_houses:
+            houses = {h.name: h for h in world.rough_houses}
+            if request.house not in houses:
+                raise ValueError(f'no house "{request.house}" on the map '
+                                 f'(have: {", ".join(houses)})')
+            self.hint = houses[request.house]
+            c = self.hint.approx_center
+            facing = math.atan2(c[1] - start[1], c[0] - start[0])
         self.facing = facing
         self.advances = 0              # discovery steps taken towards the house
         self.out_dir, self.judge, self.instruction = out_dir, judge, instruction
@@ -353,13 +375,10 @@ class HouseTask(GutterTask):
         return None, None, f'unknown decision {label}'
 
     def _after_discovery(self, pose):
-        s = self.survey
         hm = self._heightmap()
         if hm is None:
             return None, None, 'no depth scans'
-        found = [b for b in buildings(hm, self.start, min_height=s.min_building_height,
-                                      min_area=s.min_building_area)
-                 if b.distance <= self.world.search_radius]
+        found = self._found(hm)
         if not found:
             self.decide_note = self._nothing_found(pose)
             step = self._advance(pose)          # may say why it cannot move on
@@ -370,13 +389,15 @@ class HouseTask(GutterTask):
         self._update_building(hm, target)
         r = self.rect
         self.anchor = r.center
-        self.log(f'[house] nearest building {target.distance:.1f} m away: about '
+        which = 'nearest building' if self.hint is None else 'building at the rough position'
+        self.log(f'[house] {which} {target.distance:.1f} m away: about '
                  f'{r.length:.0f} x {r.width:.0f} m so far, at least {target.top:.1f} m high')
         if self.classifier is None:
             return self._refuse('no way to judge what kind of house this is')
         # Face the building, take one photo, and judge what kind of house it is
         # before choosing what to survey. 正对建筑拍一张照片，先判断房屋类型再决定扫描范围。
-        here = (round(pose[0], 2), round(pose[1], 2), round(pose[2], 2))
+        alt = self._overview_altitude(pose, hm, target)
+        here = (round(pose[0], 2), round(pose[1], 2), round(alt, 2))
         look = self.look = self._front_point()
         # Steady: the ruler is drawn with the recorded pose. 刻度尺按记录的位姿绘制，须等稳定。
         skills = [GoTo(*here, look_at=look), TakePhoto(OVERVIEW, steady=True), Decide(CLASSIFY)]
@@ -385,18 +406,46 @@ class HouseTask(GutterTask):
         return (skills + [GoTo(*p) for p in home] + [ReturnHome()], self._flight_limits(limits),
                 'photographing the house to judge what kind it is')
 
+    def _overview_altitude(self, pose: Sequence[float], hm: HeightMap, target) -> float:
+        """
+        Return the altitude to take the overview photo from, for judging what kind of house.
+
+        From above a house lower than the drone, the level camera looks down
+        on its roof and its walls fall below the picture: in Gazebo, from 6 m
+        up and 8-10 m off, single-storey houses showed only 0.5 m of wall and
+        were judged with low confidence, so not inspected. Then the drone goes
+        straight down the open column above the takeoff point until the bottom
+        of the picture meets the ground a metre in front of the house (2 deg to
+        spare for tilt), so the whole front shows, from the ground up. Ending
+        half a metre up the wall was not enough: a plain wall cut off by the
+        frame was once judged with low confidence again. A house as tall as the
+        drone is already seen face on; outside the column it stays level (L0).
+        从比房屋高的地方，水平的相机俯视屋顶，墙在画面以下：Gazebo 中从 6 米高、8 到
+        10 米外看单层房屋，墙只露出 0.5 米，判断把握不大，于是不检查。这时沿起飞点上方的
+        竖直通道直接下降，直到画面下沿落在房屋前方 1 米的地面上（留 2 度给倾斜），让整个
+        正面从地面起都在画面里。下沿只到墙上离地 0.5 米处还不够：被画面截断的素墙曾再次被
+        判为把握不大。房屋不比飞机低时本来就是正面看；不在竖直通道里时不改变高度。
+        """
+        ground = hm.ground_level
+        if target.top + ground >= pose[2] or not self._in_column(pose):
+            return float(pose[2])
+        half = math.radians(self.world.camera_vfov_deg / 2 - 2.0)
+        ahead = max(_distance_to(hm, target.cells, pose[:2]) - 1.0, 0.0)
+        alt = ground + ahead * math.tan(half)
+        return min(float(pose[2]), max(self.world.limits.min_altitude + 0.5, alt))
+
     def _advance(self, pose):
         """
         Move one step on towards the house, scan, and decide again; None if not allowed.
 
         Straight on from the takeoff point the way the drone faced on the ground,
         at the discovery altitude, the depth camera facing the way it moves. Not
-        past search_radius - DEPTH_RANGE (the scans then reach search_radius);
-        not if any depth point lies in the corridor ahead (whatever it is, the
+        past _search_reach(); not if any depth point lies in the corridor ahead
+        (whatever it is, the
         drone does not fly towards it blind); and only if all the step sweeps
         was seen free. Not seeing anything in the way is not enough: a frame may
         be missing or may not cover the way. 沿起飞时的朝向直线前进一步，深度相机朝前。
-        最远到 search_radius - DEPTH_RANGE（扫描正好覆盖到搜索半径）；前方走廊里有任何
+        最远到 _search_reach()；前方走廊里有任何
         深度点就不前进（不管那是什么，都不盲目飞过去）；并且这一步扫过的空间必须全部确认
         为空。只是没看到障碍不够：可能缺了一帧，或者那一帧没照到前进的路线。
         """
@@ -404,7 +453,7 @@ class HouseTask(GutterTask):
         u = (math.cos(self.facing), math.sin(self.facing))
         here = (pose[0], pose[1], pose[2])
         done = self._along(pose)
-        reach = min(done + s.advance_step, self.world.search_radius - DEPTH_RANGE)
+        reach = min(done + s.advance_step, self._search_reach())
         if reach - done < s.min_advance:
             return None
         ahead = self._in_the_way(here, u, reach - done + s.advance_clearance)
@@ -433,8 +482,54 @@ class HouseTask(GutterTask):
         return ((pose[0] - self.start[0]) * math.cos(self.facing)
                 + (pose[1] - self.start[1]) * math.sin(self.facing))
 
+    def _search_radius(self) -> float:
+        """Return how far from the takeoff point the house may be."""
+        if self.hint is None:
+            return self.world.search_radius
+        return math.dist(self.start, self.hint.approx_center) + self.hint.radius
+
+    def _search_reach(self) -> float:
+        """
+        Return how far discovery may move on: until the scans reach the whole search area.
+
+        Given a rough position, also not into its circle (a no-fly zone until
+        the house is seen) or within the margin of it.
+        扫描覆盖整个搜索范围为止；给了大概位置时，也不进入那个圆（看到房屋之前是禁飞区）
+        及其安全距离。
+        """
+        reach = self._search_radius() - DEPTH_RANGE
+        if self.hint is not None:
+            edge = math.dist(self.start, self.hint.approx_center) - self.hint.radius
+            reach = min(reach, edge - self.world.limits.margin - 0.5)
+        return reach
+
+    def _found(self, hm: HeightMap) -> list:
+        """
+        Return the buildings that may be the house, the likeliest first.
+
+        Without a rough position: those within search_radius, nearest the
+        takeoff point first. With one: those reaching into its circle, nearest
+        its centre first (the circle surely holds the house; a neighbour may
+        reach into it). 没有大概位置时：搜索半径内的建筑，离起飞点近的在前。有大概位置时：
+        伸进那个圆的建筑，离圆心近的在前（圆一定包住房屋，邻居也可能伸进来）。
+        """
+        s = self.survey
+        found = buildings(hm, self.start, min_height=s.min_building_height,
+                          min_area=s.min_building_area)
+        if self.hint is None:
+            return [b for b in found if b.distance <= self.world.search_radius]
+        c = self.hint.approx_center
+        near = [(_distance_to(hm, b.cells, c), b) for b in found]
+        return [b for d, b in sorted(near, key=lambda x: x[0]) if d <= self.hint.radius]
+
     def _nothing_found(self, pose: Sequence[float]) -> str:
         """Say how far discovery has looked from pose and found no building."""
+        if self.hint is not None:
+            c, r = self.hint.approx_center, self.hint.radius
+            if math.dist(pose[:2], c) + r <= DEPTH_RANGE:
+                return f'no building within {r:g} m of the rough position {c}'
+            return (f'no building seen yet within {r:g} m of the rough position {c} '
+                    f'({math.dist(pose[:2], c):.1f} m away)')
         r = self.world.search_radius
         if DEPTH_RANGE >= r:
             return f'no building within {r:g} m'
@@ -703,10 +798,7 @@ class HouseTask(GutterTask):
         return (round(float(p[0]), 2), round(float(p[1]), 2))
 
     def _target(self, hm: HeightMap):
-        s = self.survey
-        found = [b for b in buildings(hm, self.start, min_height=s.min_building_height,
-                                      min_area=s.min_building_area)
-                 if b.distance <= self.world.search_radius]
+        found = self._found(hm)
         return found[0] if found else None
 
     def _update_building(self, hm: HeightMap, target) -> None:
@@ -907,7 +999,8 @@ class HouseTask(GutterTask):
         Mark the building's unseen cells as tall as the map allows (or as rays show).
 
         Covers the outline grown by a metre across, and along a townhouse row's
-        long axis by row_extension: a row goes on past what has been seen. A ray
+        long axis by row_extension: a row goes on past what has been seen. Given
+        a rough position, as tall as the map says that house is at most. A ray
         that crossed a cell unhindered caps what can stand there. Unseen space
         elsewhere (near-ground blind spots, trees) is M4's obstacle work.
         建筑外接矩形范围内没看到的格子按允许的最高建筑高度禁飞；联排沿长轴方向再向两侧
@@ -915,7 +1008,10 @@ class HouseTask(GutterTask):
         其他未知空间（近地盲区、树木）属于 M4 的避障工作。
         """
         s = self.survey
-        top = self.world.max_building_height + hm.ground_level
+        # A rough position comes with how tall that house is at most. 给了大概位置时，
+        # 地图同时给出这栋房屋最高多高。
+        tallest = self.hint.max_height if self.hint else self.world.max_building_height
+        top = tallest + hm.ground_level
         self._update_free_space()
         seen = _dilate_mask(np.isfinite(hm.top), max(1, int(round(s.seen_fill / hm.res))))
         r = self.full_rect

@@ -35,7 +35,6 @@ from wukong_flight.skills import describe
 
 from . import llm
 from .classify import Classification, ClaudeClassifier, TruthClassifier
-from .gutter_task import GutterTask
 from .house_task import HouseTask
 from .judge import ClaudeJudge, FakeJudge, Verdict
 from .planner import (ClaudePlanner, GutterPlanner, OfflineGutterPlanner, Plan, PlanningError,
@@ -149,7 +148,7 @@ def _collect(futures: List[Tuple[str, str, Future]], timeout: float) -> List[Ver
 
 
 def _run_gutters(args, world, start, facing, out_dir, say) -> int:
-    """M2: survey a roughly known house, then photograph and judge every gutter segment."""
+    """Find and survey the house in flight, then photograph and judge every gutter segment."""
     try:
         if args.offline:
             planner, judge = OfflineGutterPlanner(world), FakeJudge()
@@ -158,17 +157,17 @@ def _run_gutters(args, world, start, facing, out_dir, say) -> int:
             judge = ClaudeJudge(args.model, args.effort)
         say(f'[run_task] understanding: "{args.instruction}"')
         request = planner.request(args.instruction)
-        if world.find_house:       # M3: find the nearest building in flight
-            task = HouseTask(world, request, start, out_dir, judge, args.instruction, log=say,
-                             facing=facing)
-            if not args.offline:   # judge the kind of house from a photo 根据照片判断房屋类型
-                task.classifier = ClaudeClassifier(args.model)
-            else:                  # sim only: the scenario's truth stands in for Claude
-                task.classifier = TruthClassifier.beside(args.map_path)
-                if task.classifier:
-                    say('[run_task] offline: house type from the simulation truth')
-        else:                      # M2: a house at a roughly known position
-            task = GutterTask(world, request, start, out_dir, judge, args.instruction, log=say)
+        # One flow for every map: the house is found in flight, near its rough
+        # position if the map gives one. 所有地图同一个流程：在飞行中找到房屋，
+        # 地图给了大概位置时就在那附近找。
+        task = HouseTask(world, request, start, out_dir, judge, args.instruction, log=say,
+                         facing=facing)
+        if not args.offline:       # judge the kind of house from a photo 根据照片判断房屋类型
+            task.classifier = ClaudeClassifier(args.model)
+        else:                      # sim only: the scenario's truth stands in for Claude
+            task.classifier = TruthClassifier.beside(args.map_path)
+            if task.classifier:
+                say('[run_task] offline: house type from the simulation truth')
     except (llm.LlmError, PlanningError, ValueError) as e:
         say(f'[run_task] no takeoff: {e}')
         write_report(out_dir, args.instruction, None, False, str(e), [])
@@ -228,14 +227,14 @@ def _run_gutters(args, world, start, facing, out_dir, say) -> int:
     return 0 if flight_ok and mission.decisions and mission.decisions[-1][1] else 1
 
 
-def understood_with_house(understood: str, task: GutterTask) -> str:
+def understood_with_house(understood: str, task: HouseTask) -> str:
     """
-    Return what the drone took the task to be, with what kind of house it judged it (M3).
+    Return what the drone took the task to be, with what kind of house it judged it.
 
-    Only HouseTask judges the house; a single-storey map's GutterTask has a
-    RoughHouse there, which has nothing to add (it once crashed the report).
-    只有 HouseTask 判断房屋类型；单层地图的 GutterTask 那里是 RoughHouse，
-    没有可补充的（曾因此在写报告时崩溃）。
+    Nothing to add if it never judged it (task.house is then None, or, in
+    the M2 flow, was a RoughHouse, which once crashed the report).
+    没有判断过房屋类型时不补充（task.house 为 None；M2 流程里曾是 RoughHouse，
+    写报告时因此崩溃过）。
     """
     house = getattr(task, 'house', None)
     if isinstance(house, Classification):
