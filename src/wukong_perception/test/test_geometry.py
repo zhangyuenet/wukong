@@ -7,8 +7,8 @@ import math
 import numpy as np
 import pytest
 
-from wukong_perception.geometry import (compass, depth_to_points, fit_house, FitError,
-                                        Intrinsics, segment_eave, segments_for)
+from wukong_perception.geometry import (compass, depth_to_points, Eave, Intrinsics,
+                                        segment_eave, segments_for)
 
 K = Intrinsics(432.5, 432.5, 320.0, 240.0)
 
@@ -68,48 +68,8 @@ def synthetic_house(center=(15.0, 0.0), bearing=90.0, length=10.0, depth=8.0, wa
     return out + rng.normal(0, noise, out.shape) if noise else out
 
 
-def test_fit_axis_aligned_house():
-    est = fit_house(synthetic_house(), approx_center=(15.5, -0.2), radius=9.0)
-    assert est.center[0] == pytest.approx(15.0, abs=0.15)
-    assert est.center[1] == pytest.approx(0.0, abs=0.15)
-    assert est.ridge_bearing_deg % 180 == pytest.approx(90.0, abs=1.0)
-    assert est.length == pytest.approx(11.0, abs=0.3)
-    assert est.width == pytest.approx(9.32, abs=0.3)     # 8 + 2 x 0.5 + gutters
-    assert est.ridge_height == pytest.approx(5.31, abs=0.15)
-    names = sorted(e.name for e in est.eaves)
-    assert names == ['north gutter', 'south gutter']
-    south = next(e for e in est.eaves if e.name == 'south gutter')
-    assert south.start[0] == pytest.approx(10.42, abs=0.2)
-    assert south.height == pytest.approx(2.7, abs=0.35)
-    assert south.side_bearing_deg == pytest.approx(180.0, abs=1.0)
-
-
-@pytest.mark.parametrize('bearing', [0.0, 30.0, 60.0, 135.0])
-def test_fit_rotated_house(bearing):
-    pts = synthetic_house(center=(16.0, 6.0), bearing=bearing, length=13.0, depth=7.0,
-                          pitch=35.0, noise=0.03)
-    est = fit_house(pts, approx_center=(15.0, 5.0), radius=10.5)
-    diff = (est.ridge_bearing_deg - bearing) % 180
-    assert min(diff, 180 - diff) < 1.5
-    assert math.dist(est.center, (16.0, 6.0)) < 0.25
-    assert est.length == pytest.approx(14.0, abs=0.3)
-    # Each eave faces away from the house, perpendicular to the ridge.
-    for e in est.eaves:
-        d = (e.side_bearing_deg - bearing) % 180
-        assert min(d, 180 - d) == pytest.approx(90, abs=1.5)
-        mid = e.point(0.5)
-        out = e.outward
-        assert (mid[0] - est.center[0]) * out[0] + (mid[1] - est.center[1]) * out[1] > 3
-
-
-def test_too_few_points_raise():
-    with pytest.raises(FitError):
-        fit_house(synthetic_house(), approx_center=(40.0, 40.0), radius=5.0)
-
-
 def test_segments():
-    est = fit_house(synthetic_house(), approx_center=(15.0, 0.0), radius=9.0)
-    south = next(e for e in est.eaves if e.name == 'south gutter')
+    south = Eave('south gutter', (10.42, -5.5), (10.42, 5.5), 2.7, 180.0)
     n = segments_for(south, 3.0)
     assert n == 4
     segs = segment_eave(south, n)
@@ -139,15 +99,6 @@ def test_tilt_is_compensated():
     tilted = depth_to_points(depth, K, (0, 0, 4.5, 0.0, 0.0, pitch), offset_frd=(0, 0, -0.26))
     assert np.abs(tilted[:, 2]).max() < 0.05
     assert np.abs(level[:, 2]).max() > 0.5
-
-
-def test_altitude_drift_is_measured_from_the_ground():
-    # The vehicle's altitude estimate is 0.3 m high: everything appears 0.3 m up.
-    pts = synthetic_house() + np.array([0.0, 0.0, 0.3])
-    est = fit_house(pts, approx_center=(15.0, 0.0), radius=9.0)
-    assert est.ground_level == pytest.approx(0.3, abs=0.02)
-    south = next(e for e in est.eaves if e.name == 'south gutter')
-    assert south.height - est.ground_level == pytest.approx(2.71, abs=0.1)
 
 
 def test_project_is_the_inverse_of_depth_to_points():

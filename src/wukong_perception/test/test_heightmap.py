@@ -33,6 +33,16 @@ def test_single_gable_house_two_eaves():
     assert south.height == pytest.approx(2.7, abs=0.25)
 
 
+def test_altitude_drift_is_measured_from_the_ground():
+    """The altitude estimate is 0.3 m high: everything appears 0.3 m up, eaves too."""
+    pts = synthetic_house(step=0.1) + np.array([0.0, 0.0, 0.3])
+    hm = HeightMap.from_points(pts, res=0.2)
+    assert hm.ground_level == pytest.approx(0.3, abs=0.05)
+    eaves = eave_lines(hm, edge_cells(hm, buildings(hm, (0.0, 0.0))[0].cells))
+    south = next(e for e in eaves if e.name == 'south gutter')
+    assert south.height - hm.ground_level == pytest.approx(2.71, abs=0.25)
+
+
 def test_an_eave_walks_out_to_its_corner_past_a_step_from_scans_not_lining_up():
     """
     Gazebo (clean): a gable end's last 0.9 m was 0.2 m further in; the eave stopped 1 m short.

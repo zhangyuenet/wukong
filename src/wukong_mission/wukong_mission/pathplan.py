@@ -193,7 +193,12 @@ def route_home(planner: Planner, pos: Point3, home: Tuple[float, float],
 @dataclass(frozen=True)
 class ViewConfig:
     standoffs: Tuple[float, ...] = (4.5, 5.5, 6.5, 8.0)   # m out from the eave
-    aboves: Tuple[float, ...] = (0.9, 1.2, 1.6, 2.0)      # m above the gutter
+    # m above the gutter lip; the camera sits 0.26 m higher still. From 0.9 m
+    # at 4.5 m the gutter is ~14.5 deg below centre and the camera looks a
+    # little into the channel (from 0.6 m up, clean gutters often showed only
+    # their outer face: "unclear"). 视点比水槽外沿高 0.9 米起（相机再高 0.26 米），
+    # 能看到一点槽内；0.6 米时干净的水槽常常只看到外侧面，被判为“看不清”。
+    aboves: Tuple[float, ...] = (0.9, 1.2, 1.6, 2.0)
     max_down_deg: float = 16.0      # camera half vertical FOV is ~21 deg; keep a margin
     shifts: Tuple[float, ...] = (0.0, 1.0, -1.0)          # m along the eave
 

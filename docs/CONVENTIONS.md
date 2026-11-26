@@ -10,8 +10,8 @@ wukong/                   仓库本身就是 colcon 工作空间
 ├── docs/                 文档
 ├── src/                  ROS 2 功能包，每个包一个目录，包名以 wukong_ 开头
 │   ├── wukong_flight/    与 PX4 通信、技能库、飞行前检查、执行计划
-│   ├── wukong_perception/ 深度图转点云、拟合房屋和屋檐线（纯 numpy）
-│   ├── wukong_mission/   大模型规划、照片判断、任务报告
+│   ├── wukong_perception/ 深度图转点云、高度图和屋檐线、体素地图（纯 numpy）
+│   ├── wukong_mission/   找房屋和逐站扫描、航线规划、大模型规划、照片判断、任务报告
 │   └── third_party/      由 wukong.repos 导入的第三方包（不提交）
 ├── sim/                  仿真世界、模型、场景（scenarios/）和场景生成、打分脚本
 ├── config/               跨功能包的配置；真实环境的配置放 config/local/（不提交）

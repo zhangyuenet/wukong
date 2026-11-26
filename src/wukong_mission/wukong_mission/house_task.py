@@ -219,22 +219,19 @@ def ring_stations(rect: Rectangle, offset: float, spacing: float,
 
 
 class HouseTask(GutterTask):
-    """State of one M3 inspection; answers MissionNode's callbacks."""
+    """State of one inspection in flight; answers MissionNode's callbacks."""
 
     def __init__(self, world: WorldMap, request: GutterRequest, start: Tuple[float, float],
                  out_dir: str, judge: Judge, instruction: str,
                  cfg: InspectionConfig = InspectionConfig(),
                  survey: SurveyConfig = SurveyConfig(),
                  log: Callable[[str], None] = print, facing: float = 0.0) -> None:
-        # Not GutterTask.__init__: that flies M2's survey round the rough house.
         # facing: the drone's heading on the ground (radians from north), the
         # way discovery moves on when the house is out of depth range; given a
         # rough position, it moves on towards that instead.
         # facing：起飞前的机头朝向（自北起算的弧度），环视看不到房屋时朝这个方向前进；
         # 地图给了大概位置时改为朝大概位置前进。
-        from concurrent.futures import ThreadPoolExecutor
-        import threading
-        self.world, self.request, self.start = world, request, start
+        super().__init__(world, request, start, out_dir, judge, instruction, cfg, log)
         self.hint: Optional[RoughHouse] = None
         if world.rough_houses:
             houses = {h.name: h for h in world.rough_houses}
@@ -246,13 +243,7 @@ class HouseTask(GutterTask):
             facing = math.atan2(c[1] - start[1], c[0] - start[0])
         self.facing = facing
         self.advances = 0              # discovery steps taken towards the house
-        self.out_dir, self.judge, self.instruction = out_dir, judge, instruction
-        self.cfg, self.survey, self.log = cfg, survey, log
-        self.depth = None
-        self.estimate = None
-        self.targets = {}
-        self.skipped = []
-        self.decide_note = ''
+        self.survey = survey
         # Aligning scans to each other (register.py) made things worse on real
         # Gazebo data; off until better localisation (M4). 扫描配准在 Gazebo 数据上
         # 反而更差，等 M4 有更好的定位后再用。
@@ -299,9 +290,6 @@ class HouseTask(GutterTask):
         self.progress = 0.0            # radians travelled round the building in this ring
         self.stations = 0
         self.eaves = []
-        self._pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix='judge')
-        self._lock = threading.Lock()
-        self._futures = []
 
     # -- before takeoff ------------------------------------------------------------------
 

@@ -153,3 +153,16 @@ def test_report_keeps_neighbours_stretches_apart():
     assert "Left out as the neighbour's: south gutter segment 3." in line
     assert 'Could not tell' not in line
     assert math.isfinite(len(line))
+
+
+def test_matching_gutters_by_direction():
+    from wukong_mission.gutter_task import matching_gutters
+    from wukong_perception.geometry import Eave
+    # A house turned 60 deg: its eaves face 330 (northwest) and 150 (southeast).
+    eaves = [Eave('northwest gutter', (19.5, -1.0), (12.5, 11.1), 2.7, 330.0),
+             Eave('southeast gutter', (12.5, 0.9), (5.5, 13.0), 2.7, 150.0)]
+    names = sorted(e.name for e in eaves)
+    assert matching_gutters(eaves, []) is None
+    assert matching_gutters(eaves, ['north']) == ['northwest gutter']   # 30 deg off
+    assert matching_gutters(eaves, ['south']) == ['southeast gutter']
+    assert sorted(matching_gutters(eaves, ['east', 'west'])) == names

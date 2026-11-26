@@ -1,34 +1,30 @@
 # Copyright 2026 Yue Zhang
 # SPDX-License-Identifier: Apache-2.0
 """
-M2 gutter inspection of a house whose position is known only roughly.
+Judging gutter photos: crop each to its segment, judge it, keep to the home inspected.
 
-Survey the house, find its eaves, photograph each gutter segment, and judge
-the photos segment by segment.
-
-Flow in flight (all callbacks from MissionNode):
+GutterTask answers MissionNode's photo callback; the flight itself (finding
+and surveying the house, choosing what to photograph) is HouseTask's
+(house_task.py). Callbacks from MissionNode:
   Scan     -> DepthCamera.capture           (depth frame -> points)
-  Decide   -> on_decide: fit_house + inspection_skills  (worker thread)
+  Decide   -> on_decide (HouseTask)         (worker thread)
   photo    -> on_photo: crop to the segment, judge in the background
-M2 水槽检查：环绕扫描粗略已知的房屋，找出屋檐，逐段拍照，逐段判断。
+水槽照片的判断：每张裁剪到对应的段再判断，只判断目标户的部分。飞行本身由 HouseTask 负责。
 """
 
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import asdict, dataclass, field
-import json
+from dataclasses import dataclass, field
 import math
-import os
 import threading
 from typing import Callable, Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
 
 import numpy as np
-from wukong_flight.skills import Limits, ReturnHome, Skill
-from wukong_perception.geometry import (fit_house, FitError, HouseEstimate, merge, project,
-                                        RGB_X500_DEPTH)
+from wukong_flight.skills import Limits
+from wukong_perception.geometry import project, RGB_X500_DEPTH
 
-from .inspection import inspection_skills, InspectionConfig, PhotoTarget, survey_skills
+from .inspection import InspectionConfig, PhotoTarget
 from .judge import Judge, Verdict
-from .world import RoughHouse, WorldMap
+from .world import WorldMap
 
 if TYPE_CHECKING:
     from wukong_flight.mission_node import MissionNode
@@ -258,32 +254,27 @@ def apply_boundaries(verdicts: List[Verdict]) -> List[Verdict]:
 
 
 class GutterTask:
-    """Holds the state of one gutter inspection and answers MissionNode's callbacks."""
+    """
+    Judges the photos of one gutter inspection; subclasses fly it (HouseTask).
+
+    Photos are judged in worker threads while the drone flies on; collect()
+    gathers the verdicts after landing. 照片在后台线程中判断，飞机继续飞；落地后收集结果。
+    """
 
     def __init__(self, world: WorldMap, request: GutterRequest, start: Tuple[float, float],
                  out_dir: str, judge: Judge, instruction: str,
                  cfg: InspectionConfig = InspectionConfig(),
                  log: Callable[[str], None] = print) -> None:
-        houses = {h.name: h for h in world.rough_houses}
-        if request.house not in houses:
-            raise ValueError(f'no house "{request.house}" on the map '
-                             f'(have: {", ".join(houses) or "none"})')
         self.world, self.request, self.start = world, request, start
-        self.house: RoughHouse = houses[request.house]
         self.out_dir, self.judge, self.instruction = out_dir, judge, instruction
         self.cfg, self.log = cfg, log
         self.depth = None                       # DepthCamera, set by attach()
-        self.estimate: Optional[HouseEstimate] = None
         self.targets: Dict[str, PhotoTarget] = {}
+        self.skipped: list = []
         self.decide_note = ''
         self._pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix='judge')
         self._lock = threading.Lock()
         self._futures: List[Tuple[str, str, Future]] = []
-
-    # -- before takeoff ---------------------------------------------------------
-
-    def plan(self) -> List[Skill]:
-        return survey_skills(self.house, self.world.limits, self.start, self.cfg) + [ReturnHome()]
 
     def attach(self, node: 'MissionNode') -> None:
         """Wire the callbacks into a MissionNode (needs a ROS node for the depth topics)."""
@@ -293,38 +284,10 @@ class GutterTask:
         node.on_decide = self.on_decide
         node.on_photo = self.on_photo
 
-    # -- in flight ----------------------------------------------------------------
-
     def on_decide(self, label: str, pose: Sequence[float]
                   ) -> Tuple[Optional[list], Optional[Limits], str]:
-        pts = merge(self.depth.clouds) if self.depth else None
-        if pts is None:
-            return None, None, 'no depth scans'
-        np.save(os.path.join(self.out_dir, 'survey_points.npy'), pts.astype(np.float32))
-        try:
-            est = fit_house(pts, self.house.approx_center, self.house.radius)
-        except FitError as e:
-            self.decide_note = f'house not found: {e}'
-            return None, None, self.decide_note
-        self.estimate = est
-        with open(os.path.join(self.out_dir, 'house_estimate.json'), 'w', encoding='utf-8') as f:
-            json.dump(asdict(est), f, indent=2)
-        g = est.ground_level
-        self.log(f'[gutters] house: {est.length:.1f} x {est.width:.1f} m, ridge '
-                 f'{est.ridge_bearing_deg:.0f} deg, {est.ridge_height - g:.1f} m high; eaves: '
-                 + ', '.join(f'{e.name} ({e.length:.1f} m at {e.height - g:.1f} m)'
-                             for e in est.eaves)
-                 + (f'; notes: {"; ".join(est.notes)}' if est.notes else ''))
-        names = matching_gutters(est.eaves, self.request.sides)
-        if names is not None and not names:
-            self.decide_note = (f'no gutter faces {", ".join(self.request.sides)}; found '
-                                + ', '.join(e.name for e in est.eaves))
-            return None, None, self.decide_note
-        skills, limits, targets = inspection_skills(
-            est, (pose[0], pose[1]), self.start, self.world.limits, self.cfg, names)
-        self.targets = targets
-        self.decide_note = f'{len(targets)} gutter segment(s) to photograph'
-        return skills, limits, self.decide_note
+        """Answer a Decide skill: what to fly next (the subclass decides)."""
+        raise NotImplementedError
 
     def on_photo(self, label: str, path: str, pose: Sequence[float]) -> None:
         import time

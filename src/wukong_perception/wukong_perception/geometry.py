@@ -1,7 +1,7 @@
 # Copyright 2026 Yue Zhang
 # SPDX-License-Identifier: Apache-2.0
 """
-Depth images to points, and points to a house with eave lines.
+Depth images to points, eave lines and their segments.
 
 Pure numpy, no ROS: tested with synthetic point clouds (test/test_geometry.py).
 纯 numpy、不依赖 ROS，用合成点云测试。
@@ -11,7 +11,7 @@ vehicle pose (the plan frame); height is above the takeoff point.
 点的坐标是（北, 东, 高度），与飞机位姿同一坐标系，高度相对起飞点。
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import math
 from typing import List, Optional, Sequence, Tuple
 
@@ -184,37 +184,6 @@ class Eave:
         return math.cos(b), math.sin(b)
 
 
-@dataclass
-class HouseEstimate:
-    center: Tuple[float, float]     # (north, east)
-    length: float                   # m, along the ridge, outline incl. overhang and gutters
-    width: float                    # m, across the ridge
-    ridge_bearing_deg: float        # 0..180
-    ridge_height: float
-    eaves: List[Eave] = field(default_factory=list)
-    # Height of the ground in the same frame, from points around the house.
-    # Heights here are in the vehicle's altitude frame, which drifts (barometer):
-    # good for flying (same frame), subtract ground_level to compare with reality.
-    # 高度与飞机高度在同一坐标系（会因气压计漂移），飞行用它没问题；与实际比较时减去地面高度。
-    ground_level: float = 0.0
-    n_points: int = 0
-    notes: List[str] = field(default_factory=list)
-
-    def corners(self) -> List[Tuple[float, float]]:
-        b = math.radians(self.ridge_bearing_deg)
-        a = (math.cos(b), math.sin(b))           # along the ridge
-        c = (-math.sin(b), math.cos(b))          # across
-        out = []
-        for sa, sc in ((1, 1), (-1, 1), (-1, -1), (1, -1)):
-            out.append((self.center[0] + sa * self.length / 2 * a[0] + sc * self.width / 2 * c[0],
-                        self.center[1] + sa * self.length / 2 * a[1] + sc * self.width / 2 * c[1]))
-        return out
-
-
-class FitError(RuntimeError):
-    """Not enough of the house was seen to fit it."""
-
-
 def _extent(x: np.ndarray, lo: float = 0.5, hi: float = 99.5) -> Tuple[float, float]:
     return float(np.percentile(x, lo)), float(np.percentile(x, hi))
 
@@ -234,107 +203,6 @@ def _best_angle(xy: np.ndarray) -> float:
     return float(min(fine, key=area)) % (math.pi / 2)
 
 
-def fit_house(points: np.ndarray, approx_center: Tuple[float, float], radius: float,
-              min_height: float = 0.8, band: float = 0.6, edge_band: float = 0.15,
-              min_points: int = 500) -> HouseEstimate:
-    """
-    Fit a gabled house to world points: outline, ridge direction, eave lines.
-
-    Keeps points within radius of approx_center and above min_height (drops
-    the ground). The outline is the minimum-area rectangle around them, which
-    includes the overhang and gutters. Of its four edges, the two where the
-    building is lowest are the eaves; the other two are gable ends.
-    以最小面积外接矩形作为房屋轮廓；四条边中最低的两条是屋檐，另外两条是山墙。
-    """
-    p = np.asarray(points, dtype=np.float64)
-    if p.ndim != 2 or p.shape[1] != 3:
-        raise ValueError('points must be (N, 3)')
-    rel = p[:, :2] - np.asarray(approx_center)
-    dist = np.hypot(rel[:, 0], rel[:, 1])
-    around = (dist > radius) & (np.abs(p[:, 2]) < 1.5)
-    ground = float(np.median(p[around, 2])) if around.sum() >= 50 else 0.0
-    keep = (dist <= radius) & (p[:, 2] >= ground + min_height)
-    p, rel = p[keep], rel[keep]
-    if len(p) < min_points:
-        raise FitError(f'only {len(p)} points on the house (need {min_points}); '
-                       'was it in view of the scans?')
-
-    a = _best_angle(rel)
-    c, s = math.cos(a), math.sin(a)
-    # Axis u at angle a from north (towards east); v at a + 90 deg.
-    u = rel[:, 0] * c + rel[:, 1] * s
-    v = -rel[:, 0] * s + rel[:, 1] * c
-    u0, u1 = _extent(u)
-    v0, v1 = _extent(v)
-    z = p[:, 2]
-
-    def edge_height(sel) -> Tuple[float, int]:
-        n = int(sel.sum())
-        return (float(np.percentile(z[sel], 90)) if n else float('nan')), n
-
-    def eave_height(key) -> float:
-        """Median height right at the outer edge: the gutter lip / roof edge."""
-        coord, lo, hi = (u, u0, u1) if key[0] == 'u' else (v, v0, v1)
-        sel = (coord <= lo + edge_band) if key[1] == '0' else (coord >= hi - edge_band)
-        if sel.sum() >= 20:
-            return float(np.median(z[sel]))
-        return edges[key][0]
-
-    edges = {
-        'u0': edge_height(u <= u0 + band), 'u1': edge_height(u >= u1 - band),
-        'v0': edge_height(v <= v0 + band), 'v1': edge_height(v >= v1 - band),
-    }
-    notes = []
-    for k, (hgt, n) in edges.items():
-        if n < 30:
-            notes.append(f'edge {k} barely seen ({n} points)')
-    mean_u = np.nanmean([edges['u0'][0], edges['u1'][0]])
-    mean_v = np.nanmean([edges['v0'][0], edges['v1'][0]])
-    # Eaves are the low pair. Edges at u0/u1 run along v, so the ridge runs along v.
-    # 低的一对是屋檐。u0/u1 两条边沿 v 方向，此时屋脊沿 v。
-    if mean_u < mean_v:
-        ridge_axis_deg = math.degrees(a) + 90.0
-        eave_keys = ('u0', 'u1')
-        length, width = v1 - v0, u1 - u0
-    else:
-        ridge_axis_deg = math.degrees(a)
-        eave_keys = ('v0', 'v1')
-        length, width = u1 - u0, v1 - v0
-    if abs(mean_u - mean_v) < 0.4:
-        notes.append(f'eaves and gables at similar height ({mean_u:.1f} vs {mean_v:.1f} m): '
-                     'roof shape unclear')
-
-    cu, cv = (u0 + u1) / 2, (v0 + v1) / 2
-    center = (approx_center[0] + cu * c - cv * s, approx_center[1] + cu * s + cv * c)
-
-    def to_world(uu, vv):
-        return (round(approx_center[0] + uu * c - vv * s, 3),
-                round(approx_center[1] + uu * s + vv * c, 3))
-
-    eaves = []
-    for key in eave_keys:
-        hgt = eave_height(key)
-        if key in ('u0', 'u1'):
-            uu = u0 if key == 'u0' else u1
-            start, end = to_world(uu, v0), to_world(uu, v1)
-            out_deg = math.degrees(a) + (180.0 if key == 'u0' else 0.0)
-        else:
-            vv = v0 if key == 'v0' else v1
-            start, end = to_world(u0, vv), to_world(u1, vv)
-            out_deg = math.degrees(a) + (270.0 if key == 'v0' else 90.0)
-        out_deg %= 360.0
-        eaves.append(Eave(compass(out_deg) + ' gutter', start, end, round(hgt, 2),
-                          round(out_deg, 1)))
-    if eaves[0].name == eaves[1].name:   # can only happen through rounding
-        eaves[1].name += ' (2)'
-    return HouseEstimate(center=(round(center[0], 3), round(center[1], 3)),
-                         length=round(length, 3), width=round(width, 3),
-                         ridge_bearing_deg=round(ridge_axis_deg % 180.0, 2),
-                         ridge_height=round(float(np.percentile(z, 99.5)), 2),
-                         eaves=eaves, n_points=int(len(p)), notes=notes,
-                         ground_level=round(ground, 3))
-
-
 Point2 = Tuple[float, float]
 
 
@@ -346,12 +214,6 @@ def segment_eave(eave: Eave, segments: int) -> List[Tuple[Point2, Point2]]:
 
 def segments_for(eave: Eave, max_length: float) -> int:
     return max(1, int(math.ceil(eave.length / max_length - 1e-6)))
-
-
-def to_rotated_box_args(est: HouseEstimate) -> dict:
-    """Arguments for wukong_flight.skills.RotatedBox (kept here free of that import)."""
-    return {'center': est.center, 'length': est.length, 'width': est.width,
-            'bearing_deg': est.ridge_bearing_deg, 'top': est.ridge_height}
 
 
 def merge(clouds: Sequence[np.ndarray]) -> Optional[np.ndarray]:
