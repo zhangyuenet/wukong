@@ -487,6 +487,12 @@ def _extend(hm: HeightMap, e: Eave, max_extend: float = 3.0) -> Eave:
     Cells right at a hip corner slope diagonally and are not classified as
     eave, so lines stop short of the corners; this walks them out to the end
     of the roof edge. 四坡顶转角处的格子坡向是斜的，屋檐线会在转角前停下；这里沿线延伸到屋面边缘的尽头。
+
+    The edge may step in by a cell where two scans do not line up: in Gazebo
+    a gable end's last 0.9 m was 0.2 m further in, and an eave stopped 1 m
+    short of its corner. So the roof is also looked for a cell further in.
+    两次扫描没对齐时，边缘可能向里错一格：Gazebo 中一个山墙端最后 0.9 米向里错了
+    0.2 米，屋檐在离转角 1 米处就停了。所以再往里一格也找屋面。
     """
     o = np.array(e.outward)
     h = e.height - hm.ground_level
@@ -499,9 +505,9 @@ def _extend(hm: HeightMap, e: Eave, max_extend: float = 3.0) -> Eave:
         return -np.inf
 
     def roof_edge_at(p):
-        inside = top_at(p - o * 0.15)
+        inside = (top_at(p - o * 0.15), top_at(p - o * (0.15 + hm.res)))
         outside = top_at(p + o * 0.6)
-        return abs(inside - h) < 0.5 and outside < h - 1.0
+        return any(abs(t - h) < 0.5 for t in inside) and outside < h - 1.0
 
     ends = [np.array(e.start, float), np.array(e.end, float)]
     d = ends[1] - ends[0]

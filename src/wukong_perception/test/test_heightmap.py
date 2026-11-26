@@ -8,8 +8,9 @@ import numpy as np
 import pytest
 
 from test_geometry import synthetic_house  # noqa: I100 - sibling test module
-from wukong_perception.heightmap import (buildings, eave_lines, edge_cells, ground_height,
-                                         HeightMap)
+from wukong_perception.geometry import Eave
+from wukong_perception.heightmap import (_extend, buildings, eave_lines, edge_cells,
+                                         ground_height, HeightMap)
 
 
 def _eaves(points, takeoff=(0.0, 0.0)):
@@ -30,6 +31,25 @@ def test_single_gable_house_two_eaves():
     south = next(e for e in eaves if e.name == 'south gutter')
     assert south.length == pytest.approx(11.0, abs=0.8)   # ends at the rakes
     assert south.height == pytest.approx(2.7, abs=0.25)
+
+
+def test_an_eave_walks_out_to_its_corner_past_a_step_from_scans_not_lining_up():
+    """
+    Gazebo (clean): a gable end's last 0.9 m was 0.2 m further in; the eave stopped 1 m short.
+
+    The west edge of a roof sloping up eastwards from 2.6 m: at east -8.0
+    north of 8.8, one cell further in (-7.8) from 7.8 to 8.8, the corner.
+    """
+    res = 0.2
+    north, east = np.arange(5.0, 22.0, res) + res / 2, np.arange(-10.0, -5.0, res) + res / 2
+    nn, ee = np.meshgrid(north, east, indexing='ij')
+    edge = np.where(nn >= 8.8, -8.1, -7.9)
+    top = np.where((ee > edge) & (nn >= 7.8), 2.6 + 0.3 * (ee - edge), 0.0)
+    hm = HeightMap((5.0, -10.0), res, top)
+    eave = Eave('west gutter', (9.5, -8.05), (20.0, -8.05), 2.65, 270.0)
+    out = _extend(hm, eave)
+    assert min(out.start[0], out.end[0]) == pytest.approx(7.9, abs=0.25)
+    assert max(out.start[0], out.end[0]) == pytest.approx(21.9, abs=0.25)   # the map's end
 
 
 @pytest.mark.parametrize('bearing', [30.0, 125.0])
