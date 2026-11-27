@@ -279,7 +279,9 @@ class GutterTask:
     def attach(self, node: 'MissionNode') -> None:
         """Wire the callbacks into a MissionNode (needs a ROS node for the depth topics)."""
         from wukong_perception.depth_camera import DepthCamera
-        self.depth = DepthCamera(node)
+        # Frames in flight too, with the pose at the moment each was imaged.
+        # 也取飞行中的帧，用成像时刻的位姿转换。
+        self.depth = DepthCamera(node, pose_at=node.pose_at)
         node.on_scan = self.depth.capture
         node.on_decide = self.on_decide
         node.on_photo = self.on_photo

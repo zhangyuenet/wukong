@@ -542,9 +542,12 @@ class HouseTask(GutterTask):
         frames = getattr(self.depth, 'frames', None)
         if frames is None:
             frames = getattr(self.depth, 'rays', [])
-        for cam, ends, hit in frames[self._voxel_rays:]:
+        # Frames keep arriving from the ROS thread: take those there are now.
+        # 帧还在由 ROS 线程加入：只取现在已有的。
+        n = len(frames)
+        for cam, ends, hit in frames[self._voxel_rays:n]:
             self.voxels.add_rays(cam, ends, hit)
-        self._voxel_rays = len(frames)
+        self._voxel_rays = n
         return self.voxels
 
     # -- flying only through space seen free (seen_free_only) ----------------------------

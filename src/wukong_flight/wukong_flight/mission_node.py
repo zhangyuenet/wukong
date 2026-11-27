@@ -15,12 +15,12 @@ Ctrl+C during flight brakes and lands; a second Ctrl+C exits at once
 import os
 import re
 import threading
-from typing import Callable, Optional, Sequence, Tuple
+from typing import Callable, Optional, Sequence, Tuple, Union
 
 import rclpy
 from rclpy.node import Node
 
-from .mission import Mission, MissionConfig, Phase
+from .mission import Mission, MissionConfig, Phase, VehicleState
 from .px4_link import Px4Link
 from .skills import Decide, Limits, Skill, TakePhoto
 
@@ -103,6 +103,23 @@ class MissionNode(Node):
 
     def _pose(self, state) -> Pose:
         return (*self.mission.plan_position(state), state.heading, state.roll, state.pitch)
+
+    def pose_at(self, stamp_us: float) -> Union[Pose, str]:
+        """
+        Return the vehicle's pose in plan coordinates at a camera frame's stamp (us), or why not.
+
+        Not before takeoff (no home yet), nor when the moment cannot be told
+        well (see Px4Link.pose_at). 起飞前（还没有起点）或成像时刻的位姿无法确定时，
+        返回原因。
+        """
+        if not self.mission.has_home:
+            return 'before takeoff'
+        p = self.link.pose_at(stamp_us)
+        if isinstance(p, str):
+            return p
+        x, y, z, heading, roll, pitch = p
+        s = VehicleState(t=0.0, connected=True, position_valid=True, x=x, y=y, z=z)
+        return (*self.mission.plan_position(s), heading, roll, pitch)
 
     def _scan(self, label: str, state) -> None:
         if self.on_scan is None:

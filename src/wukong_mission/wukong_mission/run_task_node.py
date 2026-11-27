@@ -17,6 +17,7 @@ From one sentence to a landed drone and a report.
 
 import argparse
 from concurrent.futures import Future, ThreadPoolExecutor
+import dataclasses
 import functools
 import math
 import os
@@ -24,6 +25,7 @@ import sys
 import time
 from typing import List, Optional, Tuple
 
+import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.signals import SignalHandlerOptions
@@ -114,6 +116,8 @@ def _parse_args(argv):
     p.add_argument('--out', default=None, help='output directory for photos and report')
     p.add_argument('--judge-timeout', type=float, default=120.0,
                    help='seconds to wait for photo judgements after landing')
+    p.add_argument('--seen-free', action='store_true',
+                   help='fly the survey and photos only through space seen free (M4 class A)')
     args = p.parse_args(argv)
     args.instruction = ' '.join(args.instruction)
     return args
@@ -162,6 +166,9 @@ def _run_gutters(args, world, start, facing, out_dir, say) -> int:
         # 地图给了大概位置时就在那附近找。
         task = HouseTask(world, request, start, out_dir, judge, args.instruction, log=say,
                          facing=facing)
+        if args.seen_free:
+            task.survey = dataclasses.replace(task.survey, seen_free_only=True)
+            say('[run_task] flying only through space seen free')
         if not args.offline:       # judge the kind of house from a photo 根据照片判断房屋类型
             task.classifier = ClaudeClassifier(args.model)
         else:                      # sim only: the scenario's truth stands in for Claude
@@ -190,6 +197,7 @@ def _run_gutters(args, world, start, facing, out_dir, say) -> int:
     task.attach(node)
     flight_ok = spin_mission(node)
     mission = node.mission
+    _save_flight_frames(task.depth, out_dir, say)
     note = mission.failure or ''
     for label, accepted, errors in mission.decisions:
         if not accepted:
@@ -225,6 +233,23 @@ def _run_gutters(args, world, start, facing, out_dir, say) -> int:
     say(f'[run_task] {summary_line(verdicts)}')
     say(f'[run_task] report: {md}')
     return 0 if flight_ok and mission.decisions and mission.decisions[-1][1] else 1
+
+
+def _save_flight_frames(depth, out_dir: str, say) -> None:
+    """Log the depth frames taken in flight and save their poses, to check against the truth."""
+    poses = getattr(depth, 'flight_poses', None)
+    if poses is None:
+        return
+    say(f'[run_task] depth frames in flight: {depth.describe_flight()}')
+    if poses:
+        # poses: (stamp s, north, east, altitude, heading, roll, pitch) per frame;
+        # points: some of its hit points, frame: which frame each is from.
+        # 每帧的（时间戳, 北, 东, 高度, 航向, 横滚, 俯仰），以及部分击中点和所属的帧。
+        pts = depth.flight_points
+        np.savez_compressed(
+            os.path.join(out_dir, 'flight_frames.npz'), poses=np.array(poses),
+            points=np.vstack(pts) if pts else np.zeros((0, 3), np.float32),
+            frame=np.concatenate([np.full(len(p), k, np.int32) for k, p in enumerate(pts)]))
 
 
 def understood_with_house(understood: str, task: HouseTask) -> str:

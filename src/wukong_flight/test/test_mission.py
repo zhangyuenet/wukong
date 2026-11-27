@@ -536,6 +536,29 @@ def test_scan_is_requested_when_still_and_logged():
     assert m.phase == Phase.DONE
 
 
+def test_a_scan_never_quite_still_is_taken_anyway_instead_of_landing():
+    # Gazebo's x500 bobs at about the threshold while it hovers. Gazebo 中的 x500
+    # 悬停时上下晃动的速度就在门限附近。
+    m = Mission([Takeoff(5), Scan('bobbing'), Land()])
+    cfg = MissionConfig()
+    v = FakeVehicle()
+    events, asked = [], None
+    for i in range(5000):
+        out = m.step(v.s)
+        events += out.events
+        if out.scan:
+            asked = v.s.t
+            m.scan_done(True)
+        v.apply(out)
+        if isinstance(m.plan[m.index], Scan):
+            v.s = replace(v.s, speed=0.2)
+        if m.finished:
+            break
+    assert m.phase == Phase.DONE and m.scans == [('bobbing', True)]
+    assert any('not still after 10 s, scanning anyway' in e for e in events)
+    assert asked is not None and asked > cfg.scan_settle_timeout
+
+
 def _run_with_decision(plan, answer, limits=None, config=MissionConfig()):
     """Fly plan; when Decide asks, answer with answer(mission) -> (skills, limits)."""
     from wukong_flight.skills import Limits

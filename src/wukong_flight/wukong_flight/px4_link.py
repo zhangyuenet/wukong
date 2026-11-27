@@ -9,14 +9,16 @@ rest of Wukong talks in terms of VehicleState / Setpoint / Command.
 """
 
 import math
+from typing import Union
 
-from px4_msgs.msg import (OffboardControlMode, TrajectorySetpoint, VehicleAttitude,
-                          VehicleCommand, VehicleLandDetected, VehicleLocalPosition,
-                          VehicleStatus)
+from px4_msgs.msg import (OffboardControlMode, TimesyncStatus, TrajectorySetpoint,
+                          VehicleAttitude, VehicleCommand, VehicleLandDetected,
+                          VehicleLocalPosition, VehicleStatus)
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 
 from .mission import Command, Setpoint, VehicleState
+from .pose_history import euler_from_quaternion, Pose6, PoseHistory
 
 # QoS that matches the PX4 uXRCE-DDS bridge.
 PX4_QOS = QoSProfile(
@@ -55,6 +57,9 @@ class Px4Link:
         self._pitch = 0.0
         self._status_t = -1.0
         self._position_t = -1.0
+        # Recent poses by time, for depth frames taken in flight. 最近的位姿，按时间，
+        # 用于飞行中的深度帧。
+        self.history = PoseHistory()
 
         node.create_subscription(
             VehicleStatus, px4_topic('out', 'vehicle_status', VehicleStatus),
@@ -70,6 +75,9 @@ class Px4Link:
         node.create_subscription(
             VehicleAttitude, px4_topic('out', 'vehicle_attitude', VehicleAttitude),
             self._on_attitude, PX4_QOS)
+        node.create_subscription(
+            TimesyncStatus, px4_topic('out', 'timesync_status', TimesyncStatus),
+            self._on_timesync, PX4_QOS)
 
         self._mode_pub = node.create_publisher(
             OffboardControlMode,
@@ -93,14 +101,31 @@ class Px4Link:
 
     def _on_position(self, msg: VehicleLocalPosition) -> None:
         self._position, self._position_t = msg, self._now()
+        if msg.xy_valid and msg.z_valid:
+            self.history.add_position(msg.timestamp_sample, msg.x, msg.y, msg.z)
 
     def _on_land_detected(self, msg: VehicleLandDetected) -> None:
         self._landed = bool(msg.landed)
 
     def _on_attitude(self, msg: VehicleAttitude) -> None:
-        w, x, y, z = (float(v) for v in msg.q)     # Hamilton, body FRD -> NED
-        self._roll = math.atan2(2 * (w * x + y * z), 1 - 2 * (x * x + y * y))
-        self._pitch = math.asin(max(-1.0, min(1.0, 2 * (w * y - z * x))))
+        self._roll, self._pitch, _ = euler_from_quaternion(msg.q)   # Hamilton, FRD -> NED
+        self.history.add_attitude(msg.timestamp_sample, msg.q)
+
+    def _on_timesync(self, msg: TimesyncStatus) -> None:
+        # Only the DDS link's own: a ground station's MAVLink time sync publishes
+        # here too, with its own offset. 只用 DDS 链路自己的；地面站的 MAVLink 时间
+        # 同步也发到这里，偏移不同。
+        if msg.source_protocol == TimesyncStatus.SOURCE_PROTOCOL_DDS:
+            self.history.set_offset(msg.estimated_offset, msg.timestamp)
+
+    def pose_at(self, stamp_us: float) -> Union[Pose6, str]:
+        """
+        Return the pose (PX4 local NED, heading, roll, pitch) at a frame's stamp, or why not.
+
+        See pose_history for the clocks. 时钟见 pose_history。
+        """
+        p = self.history.pose_at(stamp_us)
+        return self.history.why_not if p is None else p
 
     def describe_ages(self) -> str:
         """How old the last status and position messages are, for the log."""

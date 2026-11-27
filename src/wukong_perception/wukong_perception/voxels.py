@@ -67,6 +67,7 @@ class VoxelMap:
         self.hits = np.zeros(self.shape, np.uint8)
         self.frees = np.zeros(self.shape, np.uint8)
         self.scans = 0
+        self._mark: Optional[np.ndarray] = None   # scratch, one flag per voxel
 
     # -- indexing ------------------------------------------------------------------------
 
@@ -97,14 +98,20 @@ class VoxelMap:
         cam = np.asarray(cam, np.float64)
         ends = np.asarray(ends, np.float64)
         hit = np.asarray(hit, bool)
-        free_idx, hit_idx = [], []
+        # The voxels crossed free, marked in a grid rather than sorted: a frame
+        # crosses some 10^6 voxel steps. 空的格子在网格上标记而不排序：一帧要走约一百万步。
+        if self._mark is None:
+            self._mark = np.zeros(self.hits.size, bool)
+        mark = self._mark
+        hit_idx = []
         for k in range(0, len(ends), chunk):
             f, h = self._trace(cam, ends[k:k + chunk], hit[k:k + chunk])
-            free_idx.append(f)
+            mark[f] = True
             hit_idx.append(h)
         hits = np.unique(np.concatenate(hit_idx)) if hit_idx else np.zeros(0, np.int64)
-        frees = np.unique(np.concatenate(free_idx)) if free_idx else np.zeros(0, np.int64)
-        frees = np.setdiff1d(frees, hits, assume_unique=True)
+        mark[hits] = False
+        frees = np.flatnonzero(mark)
+        mark[frees] = False
         _bump(self.hits, hits)
         # Only crossings after the last hit can clear a voxel. 只有最后一次击中之后的
         # 空射线才能清除。
@@ -114,6 +121,7 @@ class VoxelMap:
 
     def _trace(self, cam: np.ndarray, ends: np.ndarray, hit: np.ndarray
                ) -> Tuple[np.ndarray, np.ndarray]:
+        """Return the flat indices of the voxels crossed free (repeats) and of those hit."""
         vec = ends - cam
         length = np.linalg.norm(vec, axis=1)
         if not len(length):
@@ -125,10 +133,16 @@ class VoxelMap:
         if steps > 0:
             t = np.arange(steps + 1) * step                          # metres along the ray
             ok = t[None, :] <= reach[:, None]
-            unit = vec / np.maximum(length, 1e-9)[:, None]
-            pts = cam[None, None, :] + t[None, :, None] * unit[:, None, :]
-            flat, inside = self._index(pts[ok])
-            free = np.unique(flat[inside])
+            # In voxel units, per axis, so no (rays, steps, 3) array is made.
+            # 按轴以格子为单位计算，不生成（射线, 步, 3）的数组。
+            unit = vec / np.maximum(length, 1e-9)[:, None] / self.res
+            start = (cam - self.origin) / self.res
+            flat = np.zeros(ok.shape, np.int64)
+            for a in range(3):
+                i = np.floor(start[a] + t[None, :] * unit[:, a:a + 1]).astype(np.int64)
+                ok &= (i >= 0) & (i < self.shape[a])
+                flat = flat * self.shape[a] + i
+            free = flat[ok]
         hit_flat, inside = self._index(ends[hit])
         return free, np.unique(hit_flat[inside])
 

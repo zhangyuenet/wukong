@@ -228,7 +228,9 @@ python3 sim/evaluate.py log/missions/<时间>/report.json sim/generated/basic/tr
    按位置把它和真值对应，逐段打分。
 
 输出目录里还有 `survey_points.npy`（扫描得到的点云）、`scans.npz`（每次扫描单独
-保存，带转换时用的位姿）和 `eaves.json`（识别出的屋檐），方便排查。
+保存，带转换时用的位姿）、`eaves.json`（识别出的屋檐）和 `flight_frames.npz`（飞行中
+加入体素地图的深度帧：成像时刻的位姿和每帧的一部分击中点），方便排查。日志里
+`depth frames in flight` 一行说明取了多少帧、有多少帧因为得不到成像时刻的位姿没有用。
 
 **关于高度**：PX4 的高度估计会随气压计漂移，在仿真中与真值相差可达约 0.45 米，
 偶尔几秒内突然偏开（有一次飞机实际下沉了 0.9 米，自己没察觉）。飞行和拟合使用同一个
@@ -302,8 +304,8 @@ python3 sim/mission_check.py --seen-free row_end   # M4 A 级：只飞确认为�
 
 `mission_check.py` 用光线投射代替深度相机，每个场景十几秒。`--seen-free` 打开
 `SurveyConfig.seen_free_only`，并且沿每段航线每隔 1 米取一帧深度加入体素地图（模拟
-边飞边建图），每个场景一两分钟。Gazebo 中的飞行暂时还不在飞行中取帧，所以这个开关
-默认关闭。
+边飞边建图），每个场景一两分钟。Gazebo 中对应的是 `run_task --seen-free` 和
+`SEEN_FREE=1 ./scripts/eval_m2.sh`，飞行中的深度帧按成像时刻的位姿加入体素地图。
 
 ## 10. 常见问题
 

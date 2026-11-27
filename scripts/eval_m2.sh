@@ -7,6 +7,7 @@
 #   ./scripts/eval_m2.sh                    # every sim/scenarios/*.yaml
 #   ./scripts/eval_m2.sh basic rotated      # just these
 #   OFFLINE=1 ./scripts/eval_m2.sh basic    # no Claude: checks flight and perception only
+#   SEEN_FREE=1 ./scripts/eval_m2.sh        # fly only through space seen free (M4 class A)
 #
 # Each scenario gets a fresh simulation (started and stopped here), so no
 # other simulation may be running. Uses the Claude API unless OFFLINE=1:
@@ -30,8 +31,9 @@ else
     scenarios=()
     for f in "$ROOT"/sim/scenarios/*.yaml; do scenarios+=("$(basename "$f" .yaml)"); done
 fi
-offline=()
-[ -n "${OFFLINE:-}" ] && offline=(--offline)
+flags=()
+[ -n "${OFFLINE:-}" ] && flags=(--offline)
+[ -n "${SEEN_FREE:-}" ] && flags+=(--seen-free)
 
 if pidof px4 >/dev/null || pgrep -f '^gz sim' >/dev/null; then
     echo "[eval] a simulation is already running; stop it first" >&2
@@ -71,7 +73,7 @@ for sc in "${scenarios[@]}"; do
     cp "$ROOT/sim/generated/$sc/truth.json" "$log/truth.json"
     python3 "$ROOT/sim/truth_pose.py" "$log/truth_poses.jsonl" > "$log/truth_pose.log" 2>&1 &
     recorder=$!
-    ros2 run wukong_mission run_task "${offline[@]}" --scenario "$sc" --out "$log/mission" \
+    ros2 run wukong_mission run_task "${flags[@]}" --scenario "$sc" --out "$log/mission" \
         "$INSTRUCTION" > "$log/run_task.log" 2>&1 || true
     kill -TERM "$recorder" 2>/dev/null || true
     wait "$recorder" 2>/dev/null || true

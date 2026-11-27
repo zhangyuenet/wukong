@@ -117,3 +117,13 @@ def test_rgb_intrinsics():
     from wukong_perception.geometry import RGB_X500_DEPTH
     assert RGB_X500_DEPTH.cx == 960 and RGB_X500_DEPTH.cy == 540
     assert RGB_X500_DEPTH.fx == pytest.approx(960 / math.tan(0.602))
+
+
+def test_a_frame_in_flight_is_kept_every_metre_or_turn():
+    from wukong_perception.geometry import new_viewpoint
+    last = (0.0, 0.0, 5.0, math.radians(179))
+    assert new_viewpoint(None, last)
+    assert not new_viewpoint(last, (0.6, 0.6, 5.0, math.radians(179)))     # 0.85 m
+    assert new_viewpoint(last, (0.6, 0.6, 5.6, math.radians(179)))         # 1.0 m, climbing
+    assert not new_viewpoint(last, (0.0, 0.0, 5.0, math.radians(-170)))    # 11 deg across south
+    assert new_viewpoint(last, (0.0, 0.0, 5.0, math.radians(-165)))        # 16 deg

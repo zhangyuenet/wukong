@@ -35,6 +35,14 @@ CAMERA_OFFSET_FRD = (0.132, 0.0, -0.26)
 # 在扫描改为只穿过已确认为空的空间逐步探索之前，取 18.5 米。
 DEPTH_RANGE = 18.5
 
+# Depth frames taken in flight, for the voxel map: a new one each time the
+# vehicle has moved this far or turned this much since the last frame kept
+# (scans included), sampled every FLIGHT_STRIDE pixels. 飞行中给体素地图取的深度帧：
+# 自上一帧（含扫描）以来移动了这么远或转了这么多时取一帧，每隔 FLIGHT_STRIDE 个像素取样。
+FLIGHT_STEP = 1.0          # m
+FLIGHT_TURN_DEG = 15.0
+FLIGHT_STRIDE = 8
+
 COMPASS = ['north', 'northeast', 'east', 'southeast', 'south', 'southwest', 'west', 'northwest']
 
 
@@ -48,6 +56,23 @@ class Intrinsics:
     fy: float
     cx: float
     cy: float
+
+
+def new_viewpoint(last: Optional[Sequence[float]], pose: Sequence[float],
+                  step: float = FLIGHT_STEP, turn_deg: float = FLIGHT_TURN_DEG) -> bool:
+    """
+    Tell whether pose (north, east, height, heading, ...) is a new viewpoint after last.
+
+    New when there is no last one, or the vehicle has moved at least step
+    metres or turned at least turn_deg since. 没有上一帧，或者移动了至少 step 米、
+    转了至少 turn_deg 度时算新的视点。
+    """
+    if last is None:
+        return True
+    if math.dist(last[:3], pose[:3]) >= step:
+        return True
+    turn = (pose[3] - last[3] + math.pi) % (2 * math.pi) - math.pi
+    return abs(math.degrees(turn)) >= turn_deg
 
 
 def body_to_ned(roll: float, pitch: float, yaw: float) -> np.ndarray:

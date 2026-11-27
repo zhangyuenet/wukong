@@ -105,12 +105,18 @@ class MissionConfig:
     photo_settle_time: float = 0.5         # s, continuously that still
     photo_timeout: float = 5.0             # s, give up on one photo or scan after this
     decide_timeout: float = 30.0           # s, then go on with the plan as it is
-    # Depth scans need the vehicle truly still: braking tilts it by several
-    # degrees, which is metres of error at 15 m. 深度扫描要求完全静止：刹车时
-    # 机身倾斜几度，在 15 米处就是几米的误差。
-    scan_settle_speed: float = 0.1         # m/s
-    scan_yaw_tolerance: float = 0.02       # rad (~1 deg)
+    # Depth scans need the vehicle still: braking tilts it by several degrees,
+    # which is metres of error at 15 m. They are converted with the pose at
+    # the moment of the image, tilt included, so still means not moving, not
+    # exactly on target: in Gazebo a hovering x500 bobs at about 0.1 m/s and
+    # settles 0.5-1 degree off the heading asked for. 深度扫描要求静止：刹车时机身
+    # 倾斜几度，在 15 米处就是几米的误差。扫描按成像时刻的位姿（含倾斜）转换，所以
+    # “静止”指不在动，而不是正好对准：Gazebo 中悬停的 x500 上下晃动约 0.1 m/s，
+    # 航向停在离目标 0.5–1 度处。
+    scan_settle_speed: float = 0.15        # m/s
+    scan_yaw_tolerance: float = 0.035      # rad (2 deg)
     scan_settle_time: float = 1.0          # s, continuously still before scanning
+    scan_settle_timeout: float = 10.0      # s at the point, then scan anyway
     prestream_time: float = 1.0            # s of setpoints before asking for offboard
     command_retry: float = 1.0             # s between repeated mode/arm/land commands
     ready_timeout: float = 60.0            # s to wait for PX4 to be ready
@@ -259,6 +265,11 @@ class Mission:
         """
         self._answer = (list(skills) if skills else None, limits, why)
         self._answered = True   # set last: called from a worker thread
+
+    @property
+    def has_home(self) -> bool:
+        """Tell whether the takeoff point is known (plan coordinates are measured from it)."""
+        return self._home is not None
 
     def plan_position(self, s: VehicleState) -> Tuple[float, float, float]:
         """PX4 local NED -> plan coordinates (north, east, altitude)."""
@@ -620,6 +631,16 @@ class Mission:
                 if self._settled(s, kind == 'scan' or getattr(skill, 'steady', False)):
                     self._asked_t = s.t
                     setattr(out, kind, skill.label)
+                elif (kind == 'scan' and self._arrived(s)
+                      and s.t - self._skill_start > cfg.scan_settle_timeout):
+                    # Hovering never quite still enough (it bobs at about the
+                    # threshold): scan anyway rather than time out and land.
+                    # 悬停一直达不到完全静止（上下晃动正好在门限附近）：照样扫描，
+                    # 不要等到超时降落。
+                    out.events.append(f'scan "{skill.label}": not still after '
+                                      f'{cfg.scan_settle_timeout:g} s, scanning anyway')
+                    self._asked_t = s.t
+                    out.scan = skill.label
             elif self._answered:
                 log.append((skill.label, bool(self._answer)))
                 if not self._answer:
