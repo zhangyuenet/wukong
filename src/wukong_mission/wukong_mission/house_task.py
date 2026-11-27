@@ -536,18 +536,21 @@ class HouseTask(GutterTask):
             self.voxels = VoxelMap(self.start)
             self.voxels.assume_free(Column(self.start, self.survey.open_column_radius, 0.0,
                                            self.world.limits.max_altitude + 1.0))
-        # Every frame for the map, in order: the scans and, where the depth
-        # source keeps them, the frames taken in flight. 地图用的全部深度帧，按顺序：
-        # 扫描，以及深度来源保留的飞行中的帧。
-        frames = getattr(self.depth, 'frames', None)
-        if frames is None:
-            frames = getattr(self.depth, 'rays', [])
-        # Frames keep arriving from the ROS thread: take those there are now.
-        # 帧还在由 ROS 线程加入：只取现在已有的。
-        n = len(frames)
-        for cam, ends, hit in frames[self._voxel_rays:n]:
-            self.voxels.add_rays(cam, ends, hit)
-        self._voxel_rays = n
+        # The frames since the last time, in order: the scans and the frames
+        # taken in flight, each saying whether it may count space free. A
+        # source without take_frames (a test's) has its scans' rays only.
+        # 上次以来的深度帧，按顺序：扫描和飞行中的帧，每帧说明能否计为空。没有
+        # take_frames 的深度来源（测试用的）只有扫描的射线。
+        take = getattr(self.depth, 'take_frames', None)
+        if take is not None:
+            frames = take()
+        else:
+            rays = getattr(self.depth, 'rays', [])
+            n = len(rays)        # frames may keep arriving: take those there are now
+            frames = [(*r, True) for r in rays[self._voxel_rays:n]]
+            self._voxel_rays = n
+        for cam, ends, hit, free in frames:
+            self.voxels.add_rays(cam, ends, hit, free)
         return self.voxels
 
     # -- flying only through space seen free (seen_free_only) ----------------------------

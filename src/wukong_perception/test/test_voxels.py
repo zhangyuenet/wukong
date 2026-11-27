@@ -39,6 +39,20 @@ def test_free_up_to_the_wall_occupied_at_it_unknown_behind_and_outside():
     assert list(got) == [FREE, OCCUPIED, UNKNOWN, UNKNOWN, UNKNOWN, UNKNOWN]
 
 
+def test_a_frame_without_the_pose_at_its_moment_adds_hits_but_frees_nothing():
+    m = VoxelMap((0.0, 0.0))
+    d = _fan()
+    t = (8.1 - CAM[0]) / d[:, 0]
+    m.add_rays(CAM, np.asarray(CAM) + t[:, None] * d, np.ones(len(d), bool), free=False)
+    got = m.states(np.array([(4.0, 0.0, 5.0), (8.2, 0.0, 5.0)]))
+    assert list(got) == [UNKNOWN, OCCUPIED]
+    # And it clears nothing seen free before. 也不清除之前确认的空。
+    m = VoxelMap((0.0, 0.0))
+    _wall_scan(m, wall_north=12.1)
+    m.add_rays(CAM, np.asarray(CAM) + t[:, None] * d, np.ones(len(d), bool), free=False)
+    assert list(m.states(np.array([(4.0, 0.0, 5.0), (8.2, 0.0, 5.0)]))) == [FREE, OCCUPIED]
+
+
 def test_a_branch_above_an_empty_ray_stays_unknown():
     """A ray under a branch says nothing about the branch (the old column cap did)."""
     m = VoxelMap((0.0, 0.0))

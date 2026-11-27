@@ -64,6 +64,11 @@ class VehicleState:
     preflight_ok: bool = False
     roll: float = 0.0            # radians, body FRD
     pitch: float = 0.0           # radians, nose up positive
+    # PX4's resets of its position estimate that could not be followed (their
+    # shift was not seen), so far: after one in flight, positions no longer
+    # line up with the plan and the map made before. 至今无法跟随的位置估计重置次数
+    # （没看到平移量）：飞行中出现一次，位置就和之前的计划、地图对不上了。
+    resets_missed: int = 0
 
 
 @dataclass(frozen=True)
@@ -219,6 +224,7 @@ class Mission:
         self._last_command_t = -math.inf
         self._last_t: Optional[float] = None
         self._home: Optional[Setpoint] = None
+        self._missed_at_home = 0        # resets_missed when home was set
         self._target: Optional[Setpoint] = None     # where the current skill goes
         self._carrot: Optional[Setpoint] = None     # setpoint sent, moving at max_speed
         self._asked_t: Optional[float] = None        # photo/scan/decide request sent
@@ -433,6 +439,9 @@ class Mission:
                 self._abort(s, out, 'left offboard mode, PX4 or pilot in control')
             elif self.phase == Phase.BRAKE:
                 pass
+            elif s.resets_missed > self._missed_at_home:
+                self._brake(s, out, 'PX4 reset its position estimate in a way that could not '
+                                    'be followed: the plan and the map no longer line up')
             elif self._land_requested:
                 self._brake(s, out, 'land requested')
             elif s.t - self._skill_start > self._leg_limit:
@@ -452,6 +461,7 @@ class Mission:
                                         f'start the plan was checked for {self.start}')
                     return out
                 self._home = Setpoint(s.x, s.y, s.z, s.heading)
+                self._missed_at_home = s.resets_missed
                 self._target = self._carrot = self._home
                 self._enter(Phase.PRESTREAM, s, out,
                             f'home at x={s.x:.1f} y={s.y:.1f} z={s.z:.1f}')

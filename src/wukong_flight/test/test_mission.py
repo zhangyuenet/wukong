@@ -444,6 +444,23 @@ def test_lost_position_lands():
     assert Command.LAND in v.commands
 
 
+def test_a_reset_that_cannot_be_followed_brakes_and_lands():
+    # Positions no longer line up with the plan: stop and land where it is.
+    # One missed on the ground does not matter. 位置和计划对不上了：停下来原地降落。
+    # 起飞前错过的重置没有关系。
+    m = Mission([Takeoff(5), GoTo(45, 0, 5), Land()])
+    v = FakeVehicle()
+    v.s = replace(v.s, resets_missed=1)
+
+    def lose(i, mission, vehicle):
+        if mission.index == 1 and vehicle.s.x > 10:
+            vehicle.s = replace(vehicle.s, resets_missed=2)
+    phases = run(m, v, on_tick=lose)
+    assert phases[-3:] == [Phase.BRAKE, Phase.LAND, Phase.DONE]
+    assert 'could not be followed' in m.failure
+    assert v.s.x < 30
+
+
 def test_land_request_during_flight_brakes_first():
     m = Mission([Takeoff(5), GoTo(45, 0, 5), Land()])
     v = FakeVehicle()

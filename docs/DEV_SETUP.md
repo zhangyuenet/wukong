@@ -230,7 +230,13 @@ python3 sim/evaluate.py log/missions/<时间>/report.json sim/generated/basic/tr
 输出目录里还有 `survey_points.npy`（扫描得到的点云）、`scans.npz`（每次扫描单独
 保存，带转换时用的位姿）、`eaves.json`（识别出的屋檐）和 `flight_frames.npz`（飞行中
 加入体素地图的深度帧：成像时刻的位姿和每帧的一部分击中点），方便排查。日志里
-`depth frames in flight` 一行说明取了多少帧、有多少帧因为得不到成像时刻的位姿没有用。
+`depth frames in flight` 一行说明取了多少帧、有多少帧因为得不到成像时刻的位姿没有用、
+有几次扫描只能用请求时的位姿（这样的扫描只用于房屋形状，不作为“空”的证据）。
+
+深度图像的时间戳用哪个时钟由 `run_task --depth-clock` 说明，不按时间戳猜：Gazebo 用
+仿真时钟，也就是 SITL 中 PX4 的时钟（`px4`，默认）；真实相机的驱动用机载电脑的时钟
+（`companion`），上真机时必须改。说错时日志里几乎每帧都是 “its stamp is seconds from
+every pose sample”。
 
 **关于高度**：PX4 的高度估计会随气压计漂移，在仿真中与真值相差可达约 0.45 米，
 偶尔几秒内突然偏开（有一次飞机实际下沉了 0.9 米，自己没察觉）。飞行和拟合使用同一个

@@ -82,9 +82,14 @@ class VoxelMap:
     # -- adding scans --------------------------------------------------------------------
 
     def add_rays(self, cam: Sequence[float], ends: np.ndarray, hit: np.ndarray,
-                 chunk: int = 2000) -> None:
+                 free: bool = True, chunk: int = 2000) -> None:
         """
         Add one depth frame: rays from cam to ends, hit[i] if ray i ended on a surface.
+
+        free=False for a frame whose pose is not that of the moment it was
+        imaged: its hits are still added (that only makes the map more
+        cautious), but nothing is counted free. free=False：位姿不是成像时刻的帧，
+        仍加入击中点（只会让地图更保守），但不计任何空。
 
         The format of geometry.depth_rays. A ray with a hit marks the voxels it
         crossed free, stopping one voxel short of the hit, and the hit voxel
@@ -106,7 +111,8 @@ class VoxelMap:
         hit_idx = []
         for k in range(0, len(ends), chunk):
             f, h = self._trace(cam, ends[k:k + chunk], hit[k:k + chunk])
-            mark[f] = True
+            if free:
+                mark[f] = True
             hit_idx.append(h)
         hits = np.unique(np.concatenate(hit_idx)) if hit_idx else np.zeros(0, np.int64)
         mark[hits] = False

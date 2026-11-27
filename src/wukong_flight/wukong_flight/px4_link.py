@@ -18,7 +18,7 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 
 from .mission import Command, Setpoint, VehicleState
-from .pose_history import euler_from_quaternion, Pose6, PoseHistory
+from .pose_history import euler_from_quaternion, FrameShift, Pose6, PoseHistory
 
 # QoS that matches the PX4 uXRCE-DDS bridge.
 PX4_QOS = QoSProfile(
@@ -60,6 +60,10 @@ class Px4Link:
         # Recent poses by time, for depth frames taken in flight. 最近的位姿，按时间，
         # 用于飞行中的深度帧。
         self.history = PoseHistory()
+        # One continuous local frame across PX4's estimator resets: positions in
+        # are taken less the resets, setpoints out sent plus them. 跨 PX4 估计器重置
+        # 保持连续的本地坐标：收到的位置减去重置量，发出的设定点加上重置量。
+        self.frame = FrameShift()
 
         node.create_subscription(
             VehicleStatus, px4_topic('out', 'vehicle_status', VehicleStatus),
@@ -101,15 +105,23 @@ class Px4Link:
 
     def _on_position(self, msg: VehicleLocalPosition) -> None:
         self._position, self._position_t = msg, self._now()
+        if self.frame.update(msg.xy_reset_counter, msg.delta_xy, msg.z_reset_counter,
+                             msg.delta_z):
+            dx, dy, dz = self.frame.shift
+            missed = self.frame.missed
+            self._node.get_logger().warning(
+                f'PX4 reset its position estimate (now shifted {dx:+.2f} {dy:+.2f} {dz:+.2f} m '
+                f'in all); following it' + (f'; {missed} missed' if missed else ''))
         if msg.xy_valid and msg.z_valid:
-            self.history.add_position(msg.timestamp_sample, msg.x, msg.y, msg.z)
+            x, y, z = self.frame.to_frame(msg.x, msg.y, msg.z)
+            self.history.add_position(msg.timestamp_sample, x, y, z, reset=self.frame.resets)
 
     def _on_land_detected(self, msg: VehicleLandDetected) -> None:
         self._landed = bool(msg.landed)
 
     def _on_attitude(self, msg: VehicleAttitude) -> None:
         self._roll, self._pitch, _ = euler_from_quaternion(msg.q)   # Hamilton, FRD -> NED
-        self.history.add_attitude(msg.timestamp_sample, msg.q)
+        self.history.add_attitude(msg.timestamp_sample, msg.q, reset=msg.quat_reset_counter)
 
     def _on_timesync(self, msg: TimesyncStatus) -> None:
         # Only the DDS link's own: a ground station's MAVLink time sync publishes
@@ -118,13 +130,14 @@ class Px4Link:
         if msg.source_protocol == TimesyncStatus.SOURCE_PROTOCOL_DDS:
             self.history.set_offset(msg.estimated_offset, msg.timestamp)
 
-    def pose_at(self, stamp_us: float) -> Union[Pose6, str]:
+    def pose_at(self, stamp_us: float, clock: str) -> Union[Pose6, str]:
         """
-        Return the pose (PX4 local NED, heading, roll, pitch) at a frame's stamp, or why not.
+        Return the pose (local NED, heading, roll, pitch) at a frame's stamp on clock, or why not.
 
-        See pose_history for the clocks. 时钟见 pose_history。
+        In the continuous frame, like state(). See pose_history for the
+        clocks. 和 state() 一样在连续坐标中。时钟见 pose_history。
         """
-        p = self.history.pose_at(stamp_us)
+        p = self.history.pose_at(stamp_us, clock)
         return self.history.why_not if p is None else p
 
     def describe_ages(self) -> str:
@@ -146,11 +159,12 @@ class Px4Link:
                      and t - self._position_t < POSITION_STALE_S)
         if not connected:
             return VehicleState(t=t, connected=False, position_valid=False)
+        x, y, z = self.frame.to_frame(float(pos.x), float(pos.y), float(pos.z))
         return VehicleState(
             t=t,
             connected=True,
             position_valid=bool(pos.xy_valid and pos.z_valid),
-            x=float(pos.x), y=float(pos.y), z=float(pos.z),
+            x=x, y=y, z=z,
             heading=float(pos.heading),
             speed=math.sqrt(pos.vx ** 2 + pos.vy ** 2 + pos.vz ** 2),
             armed=st.arming_state == VehicleStatus.ARMING_STATE_ARMED,
@@ -159,6 +173,7 @@ class Px4Link:
             landed=self._landed,
             preflight_ok=bool(st.pre_flight_checks_pass),
             roll=self._roll, pitch=self._pitch,
+            resets_missed=self.frame.missed,
         )
 
     # -- output -------------------------------------------------------------
@@ -172,7 +187,7 @@ class Px4Link:
         self._mode_pub.publish(mode)
 
         msg = TrajectorySetpoint()
-        msg.position = [sp.x, sp.y, sp.z]
+        msg.position = [float(v) for v in self.frame.to_px4(sp.x, sp.y, sp.z)]
         nan = float('nan')   # NaN = "not controlled" for PX4
         msg.velocity = [nan, nan, nan]
         msg.acceleration = [nan, nan, nan]

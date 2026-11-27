@@ -104,17 +104,17 @@ class MissionNode(Node):
     def _pose(self, state) -> Pose:
         return (*self.mission.plan_position(state), state.heading, state.roll, state.pitch)
 
-    def pose_at(self, stamp_us: float) -> Union[Pose, str]:
+    def pose_at(self, stamp_us: float, clock: str) -> Union[Pose, str]:
         """
-        Return the vehicle's pose in plan coordinates at a camera frame's stamp (us), or why not.
+        Return the pose in plan coordinates at a camera frame's stamp (us, on clock), or why not.
 
-        Not before takeoff (no home yet), nor when the moment cannot be told
-        well (see Px4Link.pose_at). 起飞前（还没有起点）或成像时刻的位姿无法确定时，
-        返回原因。
+        clock: pose_history.PX4_CLOCK or COMPANION_CLOCK. Not before takeoff
+        (no home yet), nor when the moment cannot be told well (see
+        Px4Link.pose_at). 起飞前（还没有起点）或成像时刻的位姿无法确定时，返回原因。
         """
         if not self.mission.has_home:
             return 'before takeoff'
-        p = self.link.pose_at(stamp_us)
+        p = self.link.pose_at(stamp_us, clock)
         if isinstance(p, str):
             return p
         x, y, z, heading, roll, pitch = p

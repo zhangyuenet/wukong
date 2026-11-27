@@ -269,6 +269,11 @@ class GutterTask:
         self.out_dir, self.judge, self.instruction = out_dir, judge, instruction
         self.cfg, self.log = cfg, log
         self.depth = None                       # DepthCamera, set by attach()
+        # The clock the depth images are stamped with (pose_history.PX4_CLOCK
+        # in Gazebo, COMPANION_CLOCK with a real camera): set before attach().
+        # 深度图像打时间戳用的时钟（Gazebo 为 PX4_CLOCK，真实相机为 COMPANION_CLOCK），
+        # 在 attach() 之前设置。
+        self.depth_clock: Optional[str] = None
         self.targets: Dict[str, PhotoTarget] = {}
         self.skipped: list = []
         self.decide_note = ''
@@ -279,9 +284,11 @@ class GutterTask:
     def attach(self, node: 'MissionNode') -> None:
         """Wire the callbacks into a MissionNode (needs a ROS node for the depth topics)."""
         from wukong_perception.depth_camera import DepthCamera
+        if self.depth_clock is None:
+            raise ValueError('say which clock the depth images are stamped with (depth_clock)')
         # Frames in flight too, with the pose at the moment each was imaged.
         # 也取飞行中的帧，用成像时刻的位姿转换。
-        self.depth = DepthCamera(node, pose_at=node.pose_at)
+        self.depth = DepthCamera(node, node.pose_at, self.depth_clock)
         node.on_scan = self.depth.capture
         node.on_decide = self.on_decide
         node.on_photo = self.on_photo

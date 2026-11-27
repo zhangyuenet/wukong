@@ -32,6 +32,7 @@ from rclpy.signals import SignalHandlerOptions
 from rclpy.utilities import remove_ros_args
 from wukong_flight.mission import MissionConfig, PlanRejected
 from wukong_flight.mission_node import MissionNode, spin_mission
+from wukong_flight.pose_history import CLOCKS, COMPANION_CLOCK, PX4_CLOCK
 from wukong_flight.px4_link import Px4Link
 from wukong_flight.skills import describe
 
@@ -118,6 +119,10 @@ def _parse_args(argv):
                    help='seconds to wait for photo judgements after landing')
     p.add_argument('--seen-free', action='store_true',
                    help='fly the survey and photos only through space seen free (M4 class A)')
+    p.add_argument('--depth-clock', default=PX4_CLOCK, choices=CLOCKS,
+                   help=f'clock the depth images are stamped with: {PX4_CLOCK} for Gazebo '
+                        f'(the simulation clock PX4 runs on), {COMPANION_CLOCK} for a real '
+                        f'camera driver (default: {PX4_CLOCK})')
     args = p.parse_args(argv)
     args.instruction = ' '.join(args.instruction)
     return args
@@ -166,6 +171,7 @@ def _run_gutters(args, world, start, facing, out_dir, say) -> int:
         # 地图给了大概位置时就在那附近找。
         task = HouseTask(world, request, start, out_dir, judge, args.instruction, log=say,
                          facing=facing)
+        task.depth_clock = args.depth_clock
         if args.seen_free:
             task.survey = dataclasses.replace(task.survey, seen_free_only=True)
             say('[run_task] flying only through space seen free')

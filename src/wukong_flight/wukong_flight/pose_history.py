@@ -13,7 +13,9 @@ re-estimating (timesync_status.estimated_offset: PX4 time = sent stamp +
 offset). A real camera stamps its frames with the companion's clock, so they
 compare directly with the sent stamps. Gazebo stamps them with the simulation
 clock, which PX4 runs on in SITL, so they are converted with the offset first.
-Which of the two a frame uses is told from how near its stamp is to each.
+Which of the two an image source uses is said by whoever sets it up
+(PX4_CLOCK or COMPANION_CLOCK), never guessed from the stamps: the two clocks
+can be close enough to be taken for each other.
 When the simulation runs slower than real time, the offset drifts, and every
 10 s or so PX4 resets its estimate: the sent stamps jump by seconds, then
 move by tens of milliseconds at each update for a few seconds. A sample is
@@ -23,17 +25,30 @@ only if it was imaged far enough after the offset last changed that the
 samples around it were all sent with the offset it is converted with.
 时钟：PX4 用自己的时钟打时间戳；uXRCE-DDS 发出时按它不断重新估计的偏移换成机载
 电脑的时钟（PX4 时间 = 发出的时间戳 + 偏移）。真实相机用机载电脑的时钟，可以直接比较；
-Gazebo 用仿真时钟，也就是 SITL 中 PX4 的时钟，要先按偏移换算。按时间戳离哪个更近
-判断用的是哪一个。仿真慢于实时时偏移会漂移，PX4 大约每 10 秒重置一次估计：发出的
+Gazebo 用仿真时钟，也就是 SITL 中 PX4 的时钟，要先按偏移换算。图像来源用哪个时钟由
+配置它的一方明确给出（PX4_CLOCK 或 COMPANION_CLOCK），不按时间戳猜：两个时钟可能
+接近到分不清。仿真慢于实时时偏移会漂移，PX4 大约每 10 秒重置一次估计：发出的
 时间戳跳几秒，之后几秒内每次更新再动几十毫秒。样本按发出时的偏移换算，每条
 timesync_status 用它自己的时间戳说明新偏移从何时起生效；所以只用成像时刻离上次
 偏移变化足够远的帧，这样它前后的样本都是用同一个偏移换算的。
+
+Estimator resets. When EKF2 resets its estimate (a GPS glitch recovered, a
+new source fused), the position or attitude jumps although the vehicle has
+not moved. No pose is interpolated across a reset. FrameShift keeps the
+local position continuous across them, the way PX4's own flight tasks shift
+their setpoints. 估计器重置：EKF2 重置估计时（GPS 故障恢复、开始融合新的来源），
+位置或姿态会跳变，而飞机并没有动。不跨重置插值位姿；FrameShift 让本地位置跨重置保持
+连续，就像 PX4 自己的飞行任务平移设定点那样。
 """
 
 from collections import deque
 from dataclasses import dataclass
 import math
-from typing import Deque, Optional, Sequence, Tuple
+from typing import Deque, Hashable, Optional, Sequence, Tuple
+
+PX4_CLOCK = 'px4'              # PX4's clock: the simulation clock in SITL (Gazebo's images)
+COMPANION_CLOCK = 'companion'  # the companion computer's clock (a real camera's driver)
+CLOCKS = (PX4_CLOCK, COMPANION_CLOCK)
 
 
 @dataclass(frozen=True)
@@ -41,7 +56,6 @@ class PoseHistoryConfig:
     keep: float = 3.0          # s of samples kept
     max_gap: float = 0.1       # s: the samples either side of a moment at most this far apart
     settle: float = 0.04       # s after the offset changes before frames are used again
-    same_clock: float = 5.0    # s: a stamp this near to one clock is on that clock
     jump: float = 0.5          # s: a gap between samples longer than this starts afresh
 
 
@@ -70,8 +84,16 @@ class _Series:
     def __init__(self, cfg: PoseHistoryConfig) -> None:
         self.cfg = cfg
         self.samples: Deque[Tuple[int, Tuple[float, ...]]] = deque()
+        self.epoch: Hashable = None        # the estimator's reset counter(s) of the samples
+        self.reset_at: Optional[int] = None   # first sample after the last reset
 
-    def add(self, stamp_us: int, values: Tuple[float, ...]) -> None:
+    def add(self, stamp_us: int, values: Tuple[float, ...], epoch: Hashable = None) -> None:
+        if self.samples and epoch != self.epoch:
+            # The estimator reset in between: never interpolate across it.
+            # 中间估计器重置过：不跨重置插值。
+            self.samples.clear()
+            self.reset_at = stamp_us
+        self.epoch = epoch
         if self.samples:
             last = self.samples[-1][0]
             if stamp_us == last:
@@ -137,52 +159,107 @@ class PoseHistory:
             self._since = int(stamp_us)
         self.offset_us = int(offset_us)
 
-    def add_position(self, stamp_us: int, x: float, y: float, z: float) -> None:
-        self._positions.add(int(stamp_us), (float(x), float(y), float(z)))
+    def add_position(self, stamp_us: int, x: float, y: float, z: float,
+                     reset: Hashable = None) -> None:
+        """Add a position sample; reset is the estimator's reset counter(s) with it."""
+        self._positions.add(int(stamp_us), (float(x), float(y), float(z)), reset)
 
-    def add_attitude(self, stamp_us: int, q: Sequence[float]) -> None:
-        self._attitudes.add(int(stamp_us), euler_from_quaternion(q))
+    def add_attitude(self, stamp_us: int, q: Sequence[float], reset: Hashable = None) -> None:
+        """Add an attitude sample; reset is the estimator's quaternion reset counter with it."""
+        self._attitudes.add(int(stamp_us), euler_from_quaternion(q), reset)
 
-    def to_sent_clock(self, stamp_us: float) -> Optional[float]:
+    def pose_at(self, stamp_us: float, clock: str) -> Optional[Pose6]:
         """
-        Return a frame's stamp on the clock the samples were sent with, or None.
+        Return the pose at a frame's stamp (us, on clock), or None if it cannot be told well.
 
-        None when it is near neither clock (no samples yet, or the clocks are
-        not what this class expects). 两个时钟都不接近时返回 None。
+        clock is PX4_CLOCK or COMPANION_CLOCK: which clock the image source
+        stamps its frames with. None (and why_not says why): no clock offset
+        yet, the stamp is seconds from every sample (a wrong clock, or the
+        offset just jumped), the offset changed less than cfg.settle before
+        it, the estimator reset around it, or there are no samples less than
+        cfg.max_gap apart either side of it. clock 指图像来源打时间戳用的时钟。
+        返回 None 的情况（why_not 说明原因）：还没有偏移、时间戳离所有样本都有几秒
+        （时钟设错，或偏移刚跳变）、成像前不到 settle 秒偏移刚变过、前后有估计器重置、
+        或者前后没有间隔小于 max_gap 的样本。
         """
+        if clock not in CLOCKS:
+            raise ValueError(f'unknown clock {clock!r}: one of {CLOCKS}')
+        if clock == PX4_CLOCK and self._since is None:
+            self.why_not = 'no clock offset from PX4 yet'
+            return None
+        t = float(stamp_us) - (self.offset_us if clock == PX4_CLOCK else 0)
         latest = self._positions.latest()
         if latest is None:
+            self.why_not = 'no pose samples yet'
             return None
-        near = self.cfg.same_clock * 1e6
-        if abs(stamp_us - latest) < near:           # the companion's clock (a real camera)
-            return float(stamp_us)
-        if abs(stamp_us - (latest + self.offset_us)) < near:   # PX4's clock (Gazebo)
-            return float(stamp_us - self.offset_us)
-        return None
-
-    def pose_at(self, stamp_us: float) -> Optional[Pose6]:
-        """
-        Return the pose at a frame's stamp (us), or None if it cannot be told well.
-
-        None (and why_not says why): the stamp is on neither clock, the offset
-        changed less than cfg.settle before it, or there are no samples less
-        than cfg.max_gap apart either side of it. 返回 None 的情况（why_not 说明
-        原因）：时间戳不在任一时钟上、成像前不到 settle 秒偏移刚变过、或者前后没有间隔
-        小于 max_gap 的样本。
-        """
-        t = self.to_sent_clock(stamp_us)
-        if t is None:
-            self.why_not = 'its stamp is on neither clock'
+        if abs(t - latest) > self.cfg.keep * 1e6:
+            self.why_not = 'its stamp is seconds from every pose sample'
             return None
         if self._since is not None and t < self._since + self.cfg.settle * 1e6:
             self.why_not = 'imaged as the clock offset changed'
             return None
         p, a = self._positions.at(t), self._attitudes.at(t)
         if p is None or a is None:
-            self.why_not = 'no pose samples close either side'
+            resets = [r.reset_at for r in (self._positions, self._attitudes)
+                      if r.reset_at is not None]
+            if any(t < r for r in resets):
+                self.why_not = 'imaged before an estimator reset'
+            else:
+                self.why_not = 'no pose samples close either side'
             return None
         (p0, p1, fp), (a0, a1, fa) = p, a
         x, y, z = (u + fp * (v - u) for u, v in zip(p0, p1))
         roll, pitch, yaw = (_angle_between(u, v, fa) for u, v in zip(a0, a1))
         yaw = (yaw + math.pi) % (2 * math.pi) - math.pi
         return x, y, z, yaw, roll, pitch
+
+
+class FrameShift:
+    """
+    One continuous local frame across PX4's resets of its position estimate.
+
+    A reset moves the local position by delta_xy, delta_z while the vehicle
+    stays where it is. PX4's own flight tasks shift their setpoints by it;
+    so does this: positions are taken less the resets so far, setpoints sent
+    plus them, so the home, the plan and the map keep lining up with where
+    the vehicle is. A counter that moved by more than one between two
+    messages hides resets whose delta was not seen: missed counts them.
+    位置估计重置时本地位置平移 delta_xy、delta_z，而飞机并没有动。PX4 自己的
+    飞行任务把设定点也平移这么多；这里同样：收到的位置减去历次重置，发出的设定点加上，
+    起点、计划和地图就仍然和飞机的实际位置对得上。两条消息之间计数器跳了不止一，说明有
+    重置的平移量没看到：missed 记下这样的次数。
+    """
+
+    def __init__(self) -> None:
+        self.shift = (0.0, 0.0, 0.0)     # sum of the resets' deltas, NED m
+        self.resets = 0                  # resets seen
+        self.missed = 0                  # resets whose delta was not seen
+        self._counters: Optional[Tuple[int, int]] = None
+
+    def update(self, xy_counter: int, delta_xy: Sequence[float], z_counter: int,
+               delta_z: float) -> bool:
+        """Take one local position message's reset fields; return True if it reset since."""
+        new = (int(xy_counter), int(z_counter))
+        old, self._counters = self._counters, new
+        if old is None:
+            return False           # resets before the first message do not matter
+        dx, dy, dz = self.shift
+        n_xy, n_z = ((b - a) % 256 for a, b in zip(old, new))   # uint8 counters
+        if n_xy:
+            dx, dy = dx + float(delta_xy[0]), dy + float(delta_xy[1])
+        if n_z:
+            dz += float(delta_z)
+        if not (n_xy or n_z):
+            return False
+        self.shift = (dx, dy, dz)
+        self.resets += 1
+        self.missed += max(n_xy - 1, 0) + max(n_z - 1, 0)
+        return True
+
+    def to_frame(self, x: float, y: float, z: float) -> Tuple[float, float, float]:
+        """Return PX4's local position in the continuous frame."""
+        return x - self.shift[0], y - self.shift[1], z - self.shift[2]
+
+    def to_px4(self, x: float, y: float, z: float) -> Tuple[float, float, float]:
+        """Return a position in the continuous frame as PX4's local position (setpoints)."""
+        return x + self.shift[0], y + self.shift[1], z + self.shift[2]

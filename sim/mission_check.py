@@ -53,10 +53,11 @@ class RayCastDepth:
         self.drift = drift
         self.rng = np.random.default_rng(seed)
         self.err = np.zeros(3)
-        # Every frame for the voxel map, in order: the scans and, with
-        # flight_step, frames along each leg (stride 8). 体素地图用的全部深度帧：
-        # 扫描，以及设了 flight_step 时沿每段航线每隔这么远取的一帧。
-        self.frames: List[tuple] = []
+        # The frames the voxel map has not taken yet, in order: the scans and,
+        # with flight_step, frames along each leg (stride 8); each (camera,
+        # ends, hit, free). 体素地图还没取走的深度帧，按顺序：扫描，以及设了 flight_step
+        # 时沿每段航线每隔这么远取的一帧；每帧为（相机, 终点, 击中, 能否计为空）。
+        self._map: List[tuple] = []
         self.flight_step = 0.0
 
     def capture(self, label: str, pose: Sequence[float], done: Callable[[bool], None]) -> None:
@@ -69,7 +70,7 @@ class RayCastDepth:
             tuple(pose[3:])
         self.clouds.append(depth_to_points(depth, K, est, stride=4))
         self.rays = getattr(self, 'rays', []) + [depth_rays(depth, K, est, stride=4)]
-        self.frames.append(self.rays[-1])
+        self._map.append((*self.rays[-1], True))
         self.errors = getattr(self, 'errors', []) + [tuple(self.err)]
         self.labels.append(label)
         self.poses.append(tuple(pose) + (0.0,) * (6 - len(pose)))
@@ -84,7 +85,12 @@ class RayCastDepth:
             p = [a[i] + (b[i] - a[i]) * k * self.flight_step / math.dist(a, b) for i in range(3)]
             depth = raycast.render_depth(self.tris, (*p, heading), stride=8)
             est = (p[0] + self.err[0], p[1] + self.err[1], p[2] + self.err[2], heading)
-            self.frames.append(depth_rays(depth, K, est, stride=8))
+            self._map.append((*depth_rays(depth, K, est, stride=8), True))
+
+    def take_frames(self) -> List[tuple]:
+        """Return the frames for the voxel map since the last call, as DepthCamera does."""
+        out, self._map = self._map, []
+        return out
 
 
 CLEARANCE = 1.0   # m: closer than this to a real building counts as a collision
